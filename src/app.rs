@@ -1,11 +1,13 @@
 //! Application: winit loop, egui side panel, scene preview via PaintCallback.
 
+use crate::capture::camera::{self, CameraInfo, CameraSource, CaptureStatus};
 use crate::capture::{FrameSlot, FrameSource, PatternKind, TestPatternSource};
 use crate::compositor::{Compositor, SCENE_H, SCENE_W};
 use crate::output::{RecorderStub, VirtualCamStub};
 use crate::scene;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -73,9 +75,13 @@ pub struct Studio {
     gfx: Option<Gfx>,
 
     screen: TestPatternSource,
-    cam: TestPatternSource,
     screen_slot: Arc<FrameSlot>,
+    cam_src: Box<dyn FrameSource>,
     cam_slot: Arc<FrameSlot>,
+    cam_devices: Vec<CameraInfo>,
+    /// 0 = test pattern, otherwise index into `cam_devices` + 1.
+    cam_choice: usize,
+    cam_status: Arc<Mutex<CaptureStatus>>,
 
     scene: scene::Scene,
     active_preset: usize,
@@ -96,18 +102,31 @@ pub struct Studio {
 impl Studio {
     pub fn new() -> Self {
         let screen = TestPatternSource::start("screen", PatternKind::Screen, SCENE_W, SCENE_H, 30);
-        let cam = TestPatternSource::start("camera", PatternKind::Webcam, 640, 480, 30);
+        let cam_devices = camera::enumerate();
+        let cam_status = Arc::new(Mutex::new(CaptureStatus::Running {
+            desc: "test pattern".into(),
+        }));
+        let cam_src: Box<dyn FrameSource> = Box::new(TestPatternSource::start(
+            "camera",
+            PatternKind::Webcam,
+            640,
+            480,
+            30,
+        ));
+        let cam_slot = cam_src.slot();
         let screen_slot = screen.slot();
-        let cam_slot = cam.slot();
         Self {
             window: None,
             egui_state: None,
             painter: None,
             gfx: None,
             screen,
-            cam,
             screen_slot,
+            cam_src,
             cam_slot,
+            cam_devices,
+            cam_choice: 0,
+            cam_status,
             scene: scene::Scene::new(),
             active_preset: 0,
             recorder: RecorderStub::new(),
@@ -116,6 +135,38 @@ impl Studio {
             debug: std::env::var("KADR_RESIZE_TEST").is_ok(),
             dbg_tick: 0,
             last_surface_size: (0, 0),
+        }
+    }
+
+    /// Switch the camera source (0 = test pattern).
+    fn set_camera(&mut self, choice: usize) {
+        self.cam_choice = choice;
+        if choice == 0 {
+            self.cam_src = Box::new(TestPatternSource::start(
+                "camera",
+                PatternKind::Webcam,
+                640,
+                480,
+                30,
+            ));
+            *self.cam_status.lock().unwrap() = CaptureStatus::Running {
+                desc: "test pattern".into(),
+            };
+        } else {
+            let idx = self.cam_devices.get(choice - 1).map(|d| d.index);
+            if let Some(index) = idx {
+                let status = Arc::new(Mutex::new(CaptureStatus::Starting));
+                self.cam_src = Box::new(CameraSource::start(index, status.clone()));
+                self.cam_status = status;
+            }
+        }
+        self.cam_slot = self.cam_src.slot();
+    }
+
+    fn rescan_cameras(&mut self) {
+        self.cam_devices = camera::enumerate();
+        if self.cam_choice > self.cam_devices.len() {
+            self.set_camera(0);
         }
     }
 
@@ -139,17 +190,57 @@ impl Studio {
                 ui.label("Источники");
                 ui.label(
                     egui::RichText::new(format!(
-                        "screen: {} → {SCENE_W}×{SCENE_H}",
+                        "screen: {} (TODO: portal capture)",
                         self.screen.describe()
                     ))
                     .small()
                     .weak(),
                 );
-                ui.label(
-                    egui::RichText::new(format!("camera: {} → 640×480", self.cam.describe()))
-                        .small()
-                        .weak(),
-                );
+                ui.separator();
+                ui.label("camera");
+                egui::ScrollArea::vertical()
+                    .max_height(96.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if ui
+                            .selectable_label(self.cam_choice == 0, "тест-паттерн")
+                            .clicked()
+                        {
+                            self.set_camera(0);
+                        }
+                        let choices: Vec<(usize, String, String)> = self
+                            .cam_devices
+                            .iter()
+                            .enumerate()
+                            .map(|(i, d)| {
+                                (
+                                    i + 1,
+                                    format!("{} (/dev/video{})", d.card, d.index),
+                                    format!("driver: {}\nformats: {}", d.driver, d.formats.join(", ")),
+                                )
+                            })
+                            .collect();
+                        for (idx, label, tooltip) in choices {
+                            if ui
+                                .selectable_label(self.cam_choice == idx, label)
+                                .on_hover_text(tooltip)
+                                .clicked()
+                            {
+                                self.set_camera(idx);
+                            }
+                        }
+                    });
+                if ui.small_button("↻ найти заново").clicked() {
+                    self.rescan_cameras();
+                }
+                let status = self.cam_status.lock().unwrap().clone();
+                let (txt, color) = match &status {
+                    CaptureStatus::Starting => ("запуск…".into(), egui::Color32::GOLD),
+                    CaptureStatus::Running { desc } => (desc.clone(), egui::Color32::from_rgb(140, 220, 140)),
+                    CaptureStatus::Error(e) => (e.clone(), egui::Color32::from_rgb(230, 110, 110)),
+                    CaptureStatus::Stopped => ("остановлена".into(), egui::Color32::GRAY),
+                };
+                ui.label(egui::RichText::new(txt).small().color(color));
             });
             ui.add_space(6.0);
 

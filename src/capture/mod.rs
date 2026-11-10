@@ -7,6 +7,7 @@
 //! - camera: v4l2 (TODO, crate `v4l` / `nokhwa`);
 //! - audio: mic + system mix via PipeWire (TODO).
 
+pub mod camera;
 pub mod pattern;
 pub mod slot;
 
