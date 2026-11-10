@@ -1,11 +1,11 @@
-//! Источники кадров (sources).
+//! Frame sources.
 //!
-//! Любой источник пишет кадры в [`slot::FrameSlot`] со своей частотой;
-//! композиитор читает самый свежий на своём темпе. Реальные источники:
-//! - экран: xdg-desktop-portal ScreenCast → PipeWire (TODO, crate `ashpd`);
-//!   «окно»/«область» — кроп монитора в композииторе, не отдельный захват;
-//! - камера: v4l2 (TODO, crate `v4l` / `nokhwa`);
-//! - аудио: микрофон + системный микс через PipeWire (TODO).
+//! Every source publishes frames into a [`slot::FrameSlot`] at its own rate;
+//! the compositor reads the latest one on its own cadence. Real sources:
+//! - screen: xdg-desktop-portal ScreenCast → PipeWire (TODO, crate `ashpd`);
+//!   "window"/"region" are a monitor crop in the compositor, not separate captures;
+//! - camera: v4l2 (TODO, crate `v4l` / `nokhwa`);
+//! - audio: mic + system mix via PipeWire (TODO).
 
 pub mod pattern;
 pub mod slot;

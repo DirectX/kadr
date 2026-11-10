@@ -1,5 +1,5 @@
-// Превью: один треугольник, растягивающий рендтаргет сцены на область
-// PaintCallback (рамка rect == NDC [-1, +1] этого viewport'а).
+// Preview: a single triangle stretching the scene render target over the
+// PaintCallback area (the callback viewport maps to NDC [-1, +1]).
 
 @group(0) @binding(0) var rt_tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;

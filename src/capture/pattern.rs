@@ -1,6 +1,6 @@
-//! Тест-паттерн вместо настоящих источников: поток генерирует «движущуюся
-//! картинку» и публикует её в слот. Позволяет проверить весь пайплайн
-//! (поток → слот → текстура → композиция) до подключения захвата.
+//! Test pattern instead of real sources: a thread generates a "moving image"
+//! and publishes it into the slot. Validates the whole pipeline
+//! (thread → slot → texture → composition) before real capture is wired in.
 
 use crate::capture::{Frame, FrameSlot};
 use std::sync::Arc;
@@ -10,14 +10,14 @@ use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub enum PatternKind {
-    /// «Экран»: сетка + световой свип — имитируем монитор спикера.
+    /// "Screen": grid + light sweep — imitates the speaker's monitor.
     Screen,
-    /// «Камера»: пульсирующая «голова» с виньеткой — имитируем лицо.
+    /// "Camera": pulsing "head" with vignette — imitates a face.
     Webcam,
 }
 
-/// Общий интерфейс источника кадра. Контракт у всех источников один:
-/// публикуем [`Frame`] в [`FrameSlot`].
+/// Shared frame source interface. One contract for every source:
+/// publish [`Frame`]s into a [`FrameSlot`].
 pub trait FrameSource: Send {
     fn slot(&self) -> Arc<FrameSlot>;
     fn describe(&self) -> String;
@@ -38,7 +38,7 @@ impl TestPatternSource {
             let frame_dt = Duration::from_millis(1000 / fps as u64);
             let t0 = std::time::Instant::now();
             let mut seq = 0u64;
-            tracing::info!(label, "источник запущен ({width}x{height} @ {fps})");
+            tracing::info!(label, "source started ({width}x{height} @ {fps})");
             while !stop_c.load(Ordering::Relaxed) {
                 let mut data = vec![0u8; (width * height * 4) as usize];
                 render(kind, t0.elapsed().as_secs_f32(), width, height, &mut data);
@@ -46,12 +46,12 @@ impl TestPatternSource {
                 slot_c.publish(Frame { width, height, seq, data });
                 thread::sleep(frame_dt);
             }
-            tracing::info!(label, "источник остановлен");
+            tracing::info!(label, "source stopped");
         });
         Self { stop, slot, label }
     }
 
-    #[allow(dead_code)] // публичный API источника; Drop тоже останавливает
+    #[allow(dead_code)] // public source API; Drop stops the thread as well
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -91,7 +91,7 @@ fn render(kind: PatternKind, t: f32, w: u32, h: u32, data: &mut [u8]) {
                         & 1
                         == 0;
                     let (mut r, mut g, mut b) = if checker { (36, 40, 52) } else { (50, 56, 74) };
-                    // светлая «презентация» по центру
+                    // light "slide" in the middle
                     if fx0(x) > w as f32 * 0.14
                         && fx0(x) < w as f32 * 0.86
                         && fy > h as f32 * 0.2
@@ -99,7 +99,7 @@ fn render(kind: PatternKind, t: f32, w: u32, h: u32, data: &mut [u8]) {
                     {
                         (r, g, b) = (74, 96, 138);
                     }
-                    // световой свип — движение видно в превью
+                    // light sweep — motion is visible in the preview
                     let d = (fx0(x) - sweep).abs();
                     if d < 50.0 {
                         let k = (1.0 - d / 50.0) * 90.0;
@@ -125,7 +125,7 @@ fn render(kind: PatternKind, t: f32, w: u32, h: u32, data: &mut [u8]) {
                     let dy = (fy - cy * 1.15) / (h as f32 / 2.0);
                     let d = (dx * dx + dy * dy).sqrt();
                     let (r, g, b) = if d < 0.62 {
-                        // «лицо» тёплое, фон — виньетка
+                        // warm "face", dark vignette background
                         (196, 164, 138)
                     } else {
                         let v = (60.0 - d * 55.0).max(8.0);

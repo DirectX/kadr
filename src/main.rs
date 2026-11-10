@@ -1,12 +1,12 @@
-//! Kadr — минималистичная студия для вебинаров.
+//! Kadr — a minimal webinar studio.
 //!
-//! Идея (см. README.md): экран спикера + камера в кружке, запись в файл,
-//! выдача готового кадра в виртуальную камеру (v4l2loopback) и, позже, RTSP.
-//! Автономный «режиссёр» вебинара: шаблоны сцен, переходы, титры.
+//! Idea (see README.md): speaker screen + camera bubble, recording to file,
+//! feeding the final frame into a virtual camera (v4l2loopback) and, later, RTSP.
+//! An autonomous webinar "director": scene templates, transitions, titles.
 //!
-//! Текущая стадия — каркас MVP: GPU-композиитор сцены (wgpu), превью поверх
-//! egui, заготовки выходов. Источники пока — тест-паттерны; портал/PipeWire,
-//! v4l2-камера и ffmpeg-запись подключаются следующим шагом.
+//! Current stage — MVP skeleton: GPU scene compositor (wgpu), egui overlay,
+//! output stubs. Sources are test patterns for now; portal/PipeWire capture,
+//! v4l2 camera and ffmpeg recording are the next steps.
 
 mod app;
 mod capture;
@@ -26,10 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let event_loop = EventLoop::new()?;
-    // ControlFlow::Wait (по умолчанию) + window.request_redraw() после каждого
-    // кадра: на Wayland это и есть темпозадатчик (см. draw_frame).
-    // TODO: фиксированные 30 fps сцены отдельным таймером, чтобы файл/вирт-камера
-    // имели стабильный тайминг, не зависящий от vsync окна.
+    // ControlFlow::Wait (default) + window.request_redraw() after every
+    // frame: on Wayland this is the frame clock (see draw_frame).
+    // TODO: fixed 30 fps scene cadence on a separate timer so file/virtual
+    // cam timing does not depend on window vsync.
     let mut app = app::Studio::new();
     event_loop.run_app(&mut app)?;
     Ok(())

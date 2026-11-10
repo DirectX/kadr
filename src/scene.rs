@@ -1,12 +1,12 @@
-//! Модель сцены: слои, пресеты (будущие JSON-шаблоны) и твины переходов.
+//! Scene model: layers, presets (future JSON templates), transition tweens.
 //!
-//! Сцена MVP: фон (экран) + слой камеры (кружок). Переход между пресетами —
-//! интерполяция позы камеры; `ease_out_back` для радиуса даёт тот самый
-//! Loom-овский «пиу» с лёгким перелётом.
+//! MVP scene: background (screen) + camera layer (circle). A preset change is
+//! an interpolation of the camera pose; `ease_out_back` on the radius gives
+//! that Loom-like "pop" with a slight overshoot.
 
 use std::time::Instant;
 
-/// Поза камеры в UV-пространстве сцены (0..1, y вниз). Радиус/рамка — доли высоты.
+/// Camera pose in scene UV space (0..1, y down). Radius/border: height fractions.
 #[derive(Clone, Copy, Debug)]
 pub struct CamPose {
     pub x: f32,
@@ -15,8 +15,8 @@ pub struct CamPose {
     pub border: f32,
 }
 
-/// Пресет сцены. Дальше это станет декларируемым JSON-шаблоном
-/// (`~/.config/kadr/scenes/*.json`) с полным набором слоёв.
+/// Scene preset. Will become a declarative JSON template
+/// (`~/.config/kadr/scenes/*.json`) with a full layer set.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
     pub name: &'static str,
@@ -93,7 +93,7 @@ impl Scene {
         self.dur = dur;
     }
 
-    /// Вызывается раз в кадр из render-loop.
+    /// Called once per frame from the render loop.
     pub fn advance(&mut self) {
         if self.dur <= 0.0 {
             return;
@@ -112,7 +112,7 @@ impl Scene {
         }
     }
 
-    /// Прямоугольник камеры в UV сцены (для маппинга текстуры внутрь круга).
+    /// Camera rect in scene UV (maps the texture inside the circle).
     pub fn cam_rect(&self, aspect: f32) -> [f32; 4] {
         let r = self.current.radius.max(1e-4);
         let rw = r / aspect;

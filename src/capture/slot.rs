@@ -1,18 +1,18 @@
-//! Слот «последний кадр побеждает».
+//! "Latest frame wins" slot.
 
 use std::sync::{Arc, Mutex};
 
-/// Один кадр RGBA8 (строки плотные, без питча).
+/// A single RGBA8 frame (tight rows, no pitch padding).
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// Монотонный счётчик: композиитор загружает только новые кадры.
+    /// Monotonic counter: the compositor uploads only new frames.
     pub seq: u64,
     pub data: Vec<u8>,
 }
 
-/// Слот свежего кадра. Очереди нет намеренно: для живого эфира важна
-/// свежесть, а не полнота; отставание потребителя само себя «сбрасывает».
+/// Fresh-frame slot. No queue on purpose: for a live stream freshness
+/// matters more than completeness; a slow consumer self-resets.
 #[derive(Default)]
 pub struct FrameSlot {
     latest: Mutex<Option<Arc<Frame>>>,

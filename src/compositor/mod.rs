@@ -1,8 +1,8 @@
-//! GPU-композиитор сцены.
+//! GPU scene compositor.
 //!
-//! Кадр собирется в offscreen-ренцтаргет фиксированного размера (canvas
-//! трансляции), поэтому путь «кадр наружу» единый: превью в окне семплирует
-//! тот же рендтаргет, что позже пойдут ffmpeg-запись и v4l2loopback.
+//! The frame is composed into a fixed-size offscreen render target (the
+//! broadcast canvas), so the "frame out" path is single: the in-window preview
+//! samples the same target that ffmpeg recording and v4l2loopback will use.
 
 mod frame_tex;
 
@@ -15,7 +15,7 @@ use std::borrow::Cow;
 pub const SCENE_W: u32 = 1280;
 pub const SCENE_H: u32 = 720;
 
-/// U-структура для uniform-буфера, зеркалирует `struct Params` в scene.wgsl.
+/// Uniform-buffer struct, mirrors `struct Params` in scene.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuScene {
@@ -31,7 +31,7 @@ pub struct GpuScene {
 }
 
 pub struct Compositor {
-    //само поле держит RT живым до выхода из приложения; доступ к view — через preview-путь
+    // keeps the RT alive until shutdown; consumers go through the preview path
     #[allow(dead_code)]
     rt: wgpu::Texture,
     rt_view: wgpu::TextureView,
@@ -223,14 +223,14 @@ impl Compositor {
         screen: &FrameSlot,
         cam: &FrameSlot,
     ) {
-        // Раздельные заимы полей, чтобы upload не ловил двойной borrow.
+        // Destructure fields so upload takes disjoint borrows.
         let Self { screen: screen_tex, screen_seq, cam: cam_tex, cam_seq, .. } = self;
         Self::upload(device, queue, screen, screen_tex, screen_seq);
         Self::upload(device, queue, cam, cam_tex, cam_seq);
     }
 
-    /// Композиция кадра сцены в offscreen-ренцтаргет. Единственный генератор
-    /// итогового кадра: все потребители (превью, файл, вирт-камера) читают его.
+    /// Composes the scene frame into the offscreen render target. The single
+    /// producer of the final frame: all consumers (preview, file, virtual cam) read it.
     pub fn render_scene(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
         let aspect = SCENE_W as f32 / SCENE_H as f32;
         let params = GpuScene {
@@ -246,7 +246,7 @@ impl Compositor {
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
 
-        // TODO: кэшировать bind group (пересобирать только при смене текстур).
+        // TODO: cache the bind group (recreate only when textures change).
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene-bind"),
             layout: &self.scene_bgl,
@@ -288,13 +288,13 @@ impl Compositor {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Ручки для превью: пайплайн, семплирующий рендтаргет. Копируются дёшево
-    /// (wgpu-хендле = Arc) в PaintCallback каждый кадр.
+    /// Preview handles: the pipeline sampling the render target. wgpu handles are
+    /// cheap Arc clones, taken into a fresh PaintCallback each frame.
     pub fn preview_handles(&self) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
         (self.preview_pipe.clone(), self.preview_bind.clone())
     }
 
-    // Пока не подключены CPU-потребители (запись/вирт-камера), accessor нужен для них.
+    // Needed by future CPU consumers (recorder / virtual cam) reading back the RT.
     #[allow(dead_code)]
     pub fn rt_view(&self) -> &wgpu::TextureView {
         &self.rt_view

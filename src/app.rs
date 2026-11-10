@@ -1,30 +1,50 @@
-//! Приложение: цикл winit, egui-панель, превью сцены через PaintCallback.
+//! Application: winit loop, egui side panel, scene preview via PaintCallback.
 
 use crate::capture::{FrameSlot, FrameSource, PatternKind, TestPatternSource};
 use crate::compositor::{Compositor, SCENE_H, SCENE_W};
 use crate::output::{RecorderStub, VirtualCamStub};
 use crate::scene;
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
-/// Превью: пайплайн, рисующий рендтаргет сцены в rect панели.
-/// Рамка rect интерпретируется как NDC [-1, +1] — см. preview.wgsl.
+/// Preview pipeline: draws the scene render target into the panel rect.
+/// The rect maps to NDC [-1, +1] of the callback viewport — see preview.wgsl.
 struct PreviewCb {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
+    debug: bool,
 }
+
+static PAINT_TICK: AtomicU64 = AtomicU64::new(0);
 
 impl egui_wgpu::CallbackTrait for PreviewCb {
     fn paint(
         &self,
-        _info: egui::epaint::PaintCallbackInfo,
+        info: egui::epaint::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         _resources: &egui_wgpu::CallbackResources,
     ) {
+        if self.debug {
+            let n = PAINT_TICK.fetch_add(1, Ordering::Relaxed);
+            if n % 15 == 0 {
+                let vp = info.viewport_in_pixels();
+                tracing::debug!(
+                    left = vp.left_px,
+                    top = vp.top_px,
+                    w = vp.width_px,
+                    h = vp.height_px,
+                    screen_px = ?info.screen_size_px,
+                    ppp = info.pixels_per_point,
+                    "preview paint"
+                );
+            }
+        }
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind, &[]);
         render_pass.draw(0..3, 0..1);
@@ -62,6 +82,15 @@ pub struct Studio {
     recorder: RecorderStub,
     vcam: VirtualCamStub,
     stats: Stats,
+
+    /// KADR_RESIZE_TEST=1: cycle window size and log preview geometry
+    /// (layout self-check during window resizes).
+    debug: bool,
+    dbg_tick: u64,
+    /// Last size reported to `Painter::on_window_resized`. On GNOME/Wayland a
+    /// programmatic resize updates `Window::inner_size()` without emitting
+    /// `WindowEvent::Resized`, so the size is polled every frame (see draw_frame).
+    last_surface_size: (u32, u32),
 }
 
 impl Studio {
@@ -84,10 +113,18 @@ impl Studio {
             recorder: RecorderStub::new(),
             vcam: VirtualCamStub::new(),
             stats: Stats::default(),
+            debug: std::env::var("KADR_RESIZE_TEST").is_ok(),
+            dbg_tick: 0,
+            last_surface_size: (0, 0),
         }
     }
 
-    fn build_ui(&mut self, ui: &mut egui::Ui, preview: &(wgpu::RenderPipeline, wgpu::BindGroup)) {
+    fn build_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: &(wgpu::RenderPipeline, wgpu::BindGroup),
+        inner_px: (u32, u32),
+    ) {
         egui::Panel::left("controls").exact_size(280.0).show(ui, |ui| {
             ui.add_space(8.0);
             ui.heading("Kadr");
@@ -169,20 +206,42 @@ impl Studio {
             .fill(egui::Color32::from_gray(9))
             .inner_margin(10.0);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            let rect = fit_rect(ui.available_rect_before_wrap(), SCENE_W as f32 / SCENE_H as f32);
+            let avail = ui.available_rect_before_wrap();
+            let rect = fit_rect(avail, SCENE_W as f32 / SCENE_H as f32);
+            if self.debug && self.dbg_tick % 15 == 0 {
+                tracing::debug!(avail = ?avail, ?rect, ?inner_px, "preview layout");
+            }
             ui.painter().add(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
                 rect,
                 PreviewCb {
                     pipeline: preview.0.clone(),
                     bind: preview.1.clone(),
+                    debug: self.debug,
                 },
             )));
         });
     }
 
+    /// Reconfigure the painter's surface when the window size changed.
+    /// Idempotent: acts only on a new size.
+    fn sync_surface_size(&mut self, painter: &mut egui_wgpu::winit::Painter, size: winit::dpi::PhysicalSize<u32>) {
+        let new = (size.width, size.height);
+        if new == self.last_surface_size || new.0 == 0 || new.1 == 0 {
+            return;
+        }
+        let (Some(w), Some(h)) = (NonZeroU32::new(new.0), NonZeroU32::new(new.1)) else {
+            return;
+        };
+        painter.on_window_resized(egui::ViewportId::ROOT, w, h);
+        self.last_surface_size = new;
+        if self.debug {
+            tracing::debug!(?new, "surface resized");
+        }
+    }
+
     fn draw_frame(&mut self) {
-        // Забираем поля из self: closure внутри run_ui должен иметь
-        // единственный изменяемый заим self.
+        // Move fields out of self: the closure inside run_ui needs the only
+        // mutable borrow of self.
         let window = self.window.clone().unwrap();
         let mut egui_state = self.egui_state.take().unwrap();
         let mut painter = self.painter.take().unwrap();
@@ -193,9 +252,27 @@ impl Studio {
         gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
         let preview = gfx.compositor.preview_handles();
 
+        // Size polling: on some Wayland compositors `WindowEvent::Resized`
+        // never arrives for programmatic resizes; egui must see the new size
+        // in the same frame as the surface, or the preview ends up in a
+        // surface of the wrong size and gets stretched by the compositor.
+        let inner = window.inner_size();
+        self.sync_surface_size(&mut painter, inner);
+        let inner_px = (inner.width, inner.height);
+
+        if self.debug {
+            self.dbg_tick += 1;
+            // Toggle the window size every 30 frames to exercise the resize path.
+            if self.dbg_tick % 30 == 0 {
+                let (w, h) = if (self.dbg_tick / 30) % 2 == 0 { (1400, 900) } else { (900, 560) };
+                let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+                tracing::debug!(to_w = w, to_h = h, "resize requested");
+            }
+        }
+
         let input = egui_state.take_egui_input(&window);
         let ctx = egui_state.egui_ctx().clone();
-        let mut out = ctx.run_ui(input, |ui| self.build_ui(ui, &preview));
+        let mut out = ctx.run_ui(input, |ui| self.build_ui(ui, &preview, inner_px));
         let clipped = ctx.tessellate(out.shapes, out.pixels_per_point);
         let _ = painter.paint_and_update_textures(
             egui::ViewportId::ROOT,
@@ -226,9 +303,9 @@ impl Studio {
         self.painter = Some(painter);
         self.gfx = Some(gfx);
 
-        // Wayland игнорирует ControlFlow::Poll: RedrawRequested приходит только
-        // от композитора. Каждый нарисованный кадр запрашивает следующий —
-        // получается самоподдерживающийся vsync-цикл без busy-wait.
+        // Wayland ignores ControlFlow::Poll: RedrawRequested only arrives from
+        // the compositor. Each drawn frame requests the next one — a
+        // self-sustaining vsync loop without busy-waiting.
         window.request_redraw();
     }
 }
@@ -236,7 +313,7 @@ impl Studio {
 impl ApplicationHandler for Studio {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
-            return; // повторный resume не пересоздаём
+            return; // do not recreate on a repeated resume
         }
 
         let attrs = Window::default_attributes()
@@ -285,13 +362,29 @@ impl ApplicationHandler for Studio {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                // egui-wgpu 0.37 does not poll the window: the painter must be
+                // told to reconfigure the surface. Usually handled by size
+                // polling in draw_frame; this arm covers event-driven platforms.
+                if let Some(mut painter) = self.painter.take() {
+                    self.sync_surface_size(&mut painter, size);
+                    self.painter = Some(painter);
+                }
+                if self.debug {
+                    tracing::debug!(?size, "WindowEvent::Resized");
+                }
+            }
             WindowEvent::RedrawRequested => self.draw_frame(),
+            event if self.debug => {
+                let inner = self.window.as_ref().map(|w| w.inner_size());
+                tracing::trace!(?event, ?inner, "win event");
+            }
             _ => {}
         }
     }
 }
 
-/// Rect с сохранением пропорций по доступной области.
+/// Aspect-preserving rect centered in the available area.
 fn fit_rect(avail: egui::Rect, aspect: f32) -> egui::Rect {
     let size = avail.size();
     let size = if size.x / size.y.max(1e-6) > aspect {

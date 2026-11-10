@@ -1,4 +1,4 @@
-//! Динамическая RGBA-текстура под кадр источника + плейсхолдеры.
+//! Dynamic RGBA texture holding the source's current frame + placeholders.
 
 use crate::capture::Frame;
 use std::borrow::Cow;
@@ -26,7 +26,7 @@ pub fn rgba_texture(
     })
 }
 
-/// Текстура текущего кадра источника; пересоздаётся при смене размера.
+/// Current frame texture; recreated when the frame size changes.
 pub struct FrameTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -35,7 +35,7 @@ pub struct FrameTexture {
 }
 
 impl FrameTexture {
-    /// Тёмный 1x1 — пока кадр источника ещё не пришёл.
+    /// Dark 1x1 — used until the first source frame arrives.
     pub fn black(device: &wgpu::Device, queue: &wgpu::Queue, label: &str) -> Self {
         let texture = rgba_texture(
             device,
@@ -77,7 +77,7 @@ impl FrameTexture {
 }
 
 fn queue_write(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, data: &[u8]) {
-    // wgpu требует кратности rows (bytes_per_row) 256.
+    // wgpu requires bytes_per_row to be a multiple of 256.
     let tight = width * 4;
     let bpr = tight.next_multiple_of(256);
     let bytes: Cow<[u8]> = if bpr == tight {

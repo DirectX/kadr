@@ -1,16 +1,16 @@
-// Композиция кадра трансляции: фон (экран) + камера-кружок с рамкой.
-// UV: (0,0) — левый верхний угол canvas'а.
+// Broadcast frame composition: background (screen) + camera circle with a ring.
+// UV: (0,0) is the top-left corner of the canvas.
 
 struct Params {
     bg_vis: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
-    cam_rect: vec4<f32>, // x, y, w, h в UV — рамка круга (для маппинга текстуры)
+    cam_rect: vec4<f32>, // x, y, w, h in UV — circle bounds (texture mapping)
     cam_vis: f32,
-    cam_radius: f32, // доля высоты canvas
+    cam_radius: f32, // fraction of canvas height
     cam_border: f32,
-    aspect: f32,     // ширина/высота canvas
+    aspect: f32,     // canvas width / height
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
