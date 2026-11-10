@@ -1,0 +1,17 @@
+[package]
+name = "kadr"
+version = "0.1.0"
+edition = "2024"
+description = "Минималистичная студия для вебинаров: экран + камера → запись, виртуальная камера, RTSP"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", features = ["winit", "capture"] }
+egui-winit = "0.37"
+pollster = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "30"
+winit = { version = "0.30", features = ["wayland", "x11"] }
