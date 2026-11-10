@@ -217,6 +217,7 @@ impl Studio {
             self.stats.fps = self.stats.frames as f32 / dt;
             self.stats.frames = 0;
             self.stats.t0 = Some(now);
+            tracing::debug!("fps: {:.1}", self.stats.fps);
         }
         self.stats.screen_seq = gfx.compositor.screen_seq;
         self.stats.cam_seq = gfx.compositor.cam_seq;
@@ -224,6 +225,11 @@ impl Studio {
         self.egui_state = Some(egui_state);
         self.painter = Some(painter);
         self.gfx = Some(gfx);
+
+        // Wayland игнорирует ControlFlow::Poll: RedrawRequested приходит только
+        // от композитора. Каждый нарисованный кадр запрашивает следующий —
+        // получается самоподдерживающийся vsync-цикл без busy-wait.
+        window.request_redraw();
     }
 }
 

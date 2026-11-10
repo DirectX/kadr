@@ -14,7 +14,7 @@ mod compositor;
 mod output;
 mod scene;
 
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::EventLoop;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -26,10 +26,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let event_loop = EventLoop::new()?;
-    // MVP: непрерывный редроун, темп задаёт v-sync.
-    // TODO: ControlFlow::Wait + таймер фиксированного fps сцены (30),
-    // чтобы файл/вирт-камера имели стабильный тайминг без зависящего от окна темпа.
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // ControlFlow::Wait (по умолчанию) + window.request_redraw() после каждого
+    // кадра: на Wayland это и есть темпозадатчик (см. draw_frame).
+    // TODO: фиксированные 30 fps сцены отдельным таймером, чтобы файл/вирт-камера
+    // имели стабильный тайминг, не зависящий от vsync окна.
     let mut app = app::Studio::new();
     event_loop.run_app(&mut app)?;
     Ok(())
