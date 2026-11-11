@@ -18,6 +18,7 @@ struct Params {
     cam_dy: f32,
     _pad5: f32,
     _pad6: f32,
+    _pad7: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

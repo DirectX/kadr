@@ -47,7 +47,12 @@ pub struct GpuScene {
     pub cam_dy: f32,
     pub _pad5: f32,
     pub _pad6: f32,
+    pub _pad7: f32,
 }
+
+// WGSL uniform structs must stay 16-byte aligned in total size; this caught a
+// silent 76-byte regression when cam_dx/cam_dy were added.
+const _: () = assert!(std::mem::size_of::<GpuScene>() % 16 == 0);
 
 pub struct Compositor {
     device: wgpu::Device,
@@ -301,6 +306,7 @@ impl Compositor {
             cam_dy: scene.track_offset[1],
             _pad5: 0.0,
             _pad6: 0.0,
+            _pad7: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
 
