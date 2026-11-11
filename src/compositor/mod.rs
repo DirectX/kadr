@@ -42,7 +42,11 @@ pub struct GpuScene {
     pub cam_full: f32,
     /// Circle layer weight, 0..1 (suppressed when growing from nothing).
     pub circle_vis: f32,
-    pub _pad4: f32,
+    /// Face-tracking pan: cover-crop window shift in source-UV units.
+    pub cam_dx: f32,
+    pub cam_dy: f32,
+    pub _pad5: f32,
+    pub _pad6: f32,
 }
 
 pub struct Compositor {
@@ -293,7 +297,10 @@ impl Compositor {
             cam_aspect: cw as f32 / ch.max(1) as f32,
             cam_full: scene.cam_full,
             circle_vis: scene.circle_vis(),
-            _pad4: 0.0,
+            cam_dx: scene.track_offset[0],
+            cam_dy: scene.track_offset[1],
+            _pad5: 0.0,
+            _pad6: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
 

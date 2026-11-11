@@ -10,6 +10,8 @@ bytemuck = { version = "1", features = ["derive"] }
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = { version = "0.37", features = ["winit", "capture"] }
 egui-winit = "0.37"
+ndarray = "0.17"
+ort = "2.0.0-rc.15"
 pollster = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

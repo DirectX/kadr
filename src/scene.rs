@@ -80,6 +80,9 @@ pub struct Scene {
     pub bg_on: bool,
     pub cam_on: bool,
     pub current: CamPose,
+    /// Face-tracking pan (source-UV offset), written by the render loop from
+    /// the tracker thread's shared state.
+    pub track_offset: [f32; 2],
     start: Instant,
     dur: f32,
     /// Crossfade blends: background opacity and camera-full coverage, both
@@ -105,6 +108,7 @@ impl Scene {
             bg_on: p.bg_on,
             cam_on: p.cam_on,
             current: p.cam,
+            track_offset: [0.0; 2],
             start: Instant::now(),
             dur: 0.0,
             from_bg_alpha: 1.0,

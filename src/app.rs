@@ -7,6 +7,7 @@ use crate::output::recorder::{self, AudioSource, Recorder, RecorderState};
 use crate::output::vcam::{self, VcamInfo, VcamStatus, VirtualCam};
 use crate::output::Pacer;
 use crate::scene;
+use crate::track::FaceTracker;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -91,6 +92,9 @@ pub struct Studio {
 
     scene: scene::Scene,
     active_preset: usize,
+    /// Face tracking (YuNet) toggle; the tracker thread idles when off.
+    tracking: bool,
+    tracker: FaceTracker,
     recorder: Recorder,
     audio_sources: Vec<AudioSource>,
     audio_choice: usize,
@@ -147,6 +151,8 @@ impl Studio {
             cam_status,
             scene: scene::Scene::new(),
             active_preset: 0,
+            tracking: false,
+            tracker: FaceTracker::new(),
             recorder: Recorder::new(),
             audio_sources: recorder::list_audio_sources(),
             audio_choice: 0,
@@ -189,12 +195,37 @@ impl Studio {
             }
         }
         self.cam_slot = self.cam_src.slot();
+        // Retarget the tracker; it resets its smoothing for the new viewpoint.
+        if self.tracking {
+            self.tracker.attach(self.cam_slot.clone());
+        }
     }
 
     fn rescan_cameras(&mut self) {
         self.cam_devices = camera::enumerate();
         if self.cam_choice > self.cam_devices.len() {
             self.set_camera(0);
+        }
+    }
+
+    /// Toggle face tracking; attaching resets smoothing, detaching zeroes it.
+    fn set_tracking(&mut self, on: bool) {
+        self.tracking = on;
+        if on {
+            self.tracker.attach(self.cam_slot.clone());
+        } else {
+            self.tracker.detach();
+            self.scene.track_offset = [0.0; 2];
+        }
+        tracing::info!(on, "face tracking");
+    }
+
+    /// Hotkeys 1..9 switch camera sources (the manual-director remote).
+    fn hotkey_camera(&mut self, number: usize) {
+        if number <= self.cam_devices.len() {
+            self.set_camera(number);
+            let name = self.cam_devices.get(number.saturating_sub(1)).map(|d| d.card.as_str()).unwrap_or("?");
+            tracing::info!(slot = number, name, "hotkey: camera switch");
         }
     }
 
@@ -285,6 +316,29 @@ impl Studio {
                         self.active_preset = idx;
                         self.scene.transition_to(layout, 0.6);
                     }
+                }
+                ui.separator();
+                let mut tr = self.tracking;
+                if ui.checkbox(&mut tr, "трекинг лица (YuNet)").changed() {
+                    self.set_tracking(tr);
+                }
+                if self.tracking {
+                    let ts = self.tracker.state();
+                    let dot = if ts.confidence > 0.3 { "●" } else { "○" };
+                    let col = if ts.confidence > 0.3 {
+                        egui::Color32::from_rgb(140, 220, 140)
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{dot} лицо: {:.0}% · размер {:.0}%",
+                            ts.confidence * 100.0,
+                            ts.face_size * 100.0
+                        ))
+                        .small()
+                        .color(col),
+                    );
                 }
             });
             ui.add_space(6.0);
@@ -502,6 +556,9 @@ impl Studio {
 
         gfx.compositor.update_sources(&gfx.device, &gfx.queue, &self.screen_slot, &self.cam_slot);
         self.scene.advance();
+        if self.tracking {
+            self.scene.track_offset = self.tracker.state().offset;
+        }
         gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
 
         // Sink taps: one paced grab fans out to every active CPU consumer.
@@ -680,6 +737,31 @@ impl ApplicationHandler for Studio {
                 }
             }
             WindowEvent::RedrawRequested => self.draw_frame(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                use winit::event::ElementState;
+                if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                // Physical digits are layout-independent (the director remote).
+                use winit::keyboard::{KeyCode, PhysicalKey};
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Digit1) => self.hotkey_camera(1),
+                    PhysicalKey::Code(KeyCode::Digit2) => self.hotkey_camera(2),
+                    PhysicalKey::Code(KeyCode::Digit3) => self.hotkey_camera(3),
+                    PhysicalKey::Code(KeyCode::Digit4) => self.hotkey_camera(4),
+                    PhysicalKey::Code(KeyCode::Digit5) => self.hotkey_camera(5),
+                    PhysicalKey::Code(KeyCode::Digit6) => self.hotkey_camera(6),
+                    PhysicalKey::Code(KeyCode::Digit7) => self.hotkey_camera(7),
+                    PhysicalKey::Code(KeyCode::Digit8) => self.hotkey_camera(8),
+                    PhysicalKey::Code(KeyCode::Digit9) => self.hotkey_camera(9),
+                    PhysicalKey::Code(KeyCode::Digit0) => self.hotkey_camera(0),
+                    PhysicalKey::Code(KeyCode::KeyT) => {
+                        let on = !self.tracking;
+                        self.set_tracking(on);
+                    }
+                    _ => {}
+                }
+            }
             event if self.debug => {
                 let inner = self.window.as_ref().map(|w| w.inner_size());
                 tracing::trace!(?event, ?inner, "win event");

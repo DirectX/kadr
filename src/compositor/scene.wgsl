@@ -14,7 +14,10 @@ struct Params {
     cam_aspect: f32, // camera source width / height
     cam_full: f32,   // 0..1 crossfade into fullscreen camera cover
     circle_vis: f32, // 0..1 circle weight (suppressed when it would grow from nothing)
-    _pad4: f32,
+    cam_dx: f32,     // face-tracking pan: cover-crop window shift, source UV
+    cam_dy: f32,
+    _pad5: f32,
+    _pad6: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -60,7 +63,10 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
         // Fullscreen cover (the "speaker full" preset, crossfaded in).
         if (p.cam_full > 0.001) {
             let crop = cover_crop(p.aspect, p.cam_aspect);
-            let uv = vec2<f32>(0.5) + (input.uv - vec2<f32>(0.5)) * crop;
+            // Face-tracking pan: slide the window center, but keep it inside
+            // the source (the window must never sample outside the frame).
+            let c = clamp(vec2(0.5) + vec2(p.cam_dx, p.cam_dy), crop * 0.5, vec2(1.0) - crop * 0.5);
+            let uv = c + (input.uv - vec2(0.5)) * crop;
             let cam = textureSampleLevel(cam_tex, smp, clamp(uv, vec2(0.002), vec2(0.998)), 0.0);
             color = mix(color, cam, p.cam_full);
         }
@@ -79,7 +85,8 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
                      * (1.0 - smoothstep(ring_out - aa, ring_out + aa, dist))
                      * circle_w;
             let crop = cover_crop(1.0, p.cam_aspect);
-            let cam_uv = vec2<f32>(0.5) + d / (p.cam_rect.zw * 0.5) * (crop * 0.5);
+            let c = clamp(vec2(0.5) + vec2(p.cam_dx, p.cam_dy), crop * 0.5, vec2(1.0) - crop * 0.5);
+            let cam_uv = c + d / (p.cam_rect.zw * 0.5) * (crop * 0.5);
             let cam = textureSampleLevel(cam_tex, smp, clamp(cam_uv, vec2(0.002), vec2(0.998)), 0.0);
             color = mix(color, cam, inside);
             color = mix(color, vec4<f32>(1.0, 1.0, 1.0, 1.0), ring * 0.9);

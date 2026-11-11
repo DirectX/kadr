@@ -13,6 +13,7 @@ mod capture;
 mod compositor;
 mod output;
 mod scene;
+mod track;
 
 use winit::event_loop::EventLoop;
 
