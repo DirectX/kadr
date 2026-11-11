@@ -619,30 +619,6 @@ mod tests {
             assert_eq!(px[3], 255);
         }
     }
-}
-
-#[cfg(test)]
-mod bench {
-    use super::*;
-
-    /// Measure zune-jpeg throughput for a 720p camera frame.
-    #[test]
-    fn mjpeg_720_decode_cost() {
-        let jpg = include_bytes!("../../tests/fixtures/mjpeg_720.jpg");
-        let mut rgba = vec![0u8; 1280 * 720 * 4];
-        let t = std::time::Instant::now();
-        let iters = 20;
-        for _ in 0..iters {
-            let mut dec = zune_jpeg::JpegDecoder::new_with_options(
-                &jpg[..],
-                DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGBA),
-            );
-            dec.decode_into(&mut rgba).expect("decode");
-        }
-        let per = t.elapsed().as_secs_f64() / iters as f64;
-        eprintln!("mjpeg 720p decode: {:.2} ms/frame -> {:.0} fps single-threaded", per * 1e3, 1.0 / per);
-    }
-
     #[test]
     fn claim_serializes_device_owners() {
         // Unique index so this test cannot collide with real devices.
@@ -690,4 +666,29 @@ mod bench {
         let el = t0.elapsed();
         assert!(el < Duration::from_millis(1500), "stop ignored, slept {el:?}");
     }
+}
+
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Measure zune-jpeg throughput for a 720p camera frame.
+    #[test]
+    fn mjpeg_720_decode_cost() {
+        let jpg = include_bytes!("../../tests/fixtures/mjpeg_720.jpg");
+        let mut rgba = vec![0u8; 1280 * 720 * 4];
+        let t = std::time::Instant::now();
+        let iters = 20;
+        for _ in 0..iters {
+            let mut dec = zune_jpeg::JpegDecoder::new_with_options(
+                &jpg[..],
+                DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGBA),
+            );
+            dec.decode_into(&mut rgba).expect("decode");
+        }
+        let per = t.elapsed().as_secs_f64() / iters as f64;
+        eprintln!("mjpeg 720p decode: {:.2} ms/frame -> {:.0} fps single-threaded", per * 1e3, 1.0 / per);
+    }
+
 }
