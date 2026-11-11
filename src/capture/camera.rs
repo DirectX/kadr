@@ -179,6 +179,9 @@ fn attempt(
     let mut frames = 0u64;
     let mut rgba = vec![0u8; npix * 4];
     let mut last_frame = Instant::now();
+    // Throughput diagnostics: report the real delivered rate periodically.
+    let mut rate_window = Instant::now();
+    let mut rate_frames = 0u64;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -188,13 +191,23 @@ fn attempt(
         match stream.next() {
             Ok((data, meta)) => {
                 frames += 1;
+                rate_frames += 1;
                 if frames == 1 {
                     tracing::info!(%desc, "camera running");
                     *status.lock().unwrap() = CaptureStatus::Running { desc: desc.clone() };
                 }
+                if rate_window.elapsed() > Duration::from_secs(2) {
+                    let fps = rate_frames as f64 / rate_window.elapsed().as_secs_f64();
+                    tracing::info!(%desc, fps = format!("{fps:.1}"), "camera throughput");
+                    rate_window = Instant::now();
+                    rate_frames = 0;
+                }
                 let n = (meta.bytesused as usize).min(data.len());
-                rgba.clear();
-                rgba.resize(npix * 4, 0u8);
+                // Reallocate only when the frame size changed; the decoder and
+                // converters overwrite every pixel, so no per-frame zeroing.
+                if rgba.len() != npix * 4 {
+                    rgba = vec![0u8; npix * 4];
+                }
                 if is_mjpeg {
                     // MJPEG: zune-jpeg decodes straight into the RGBA buffer.
                     let mut dec = zune_jpeg::JpegDecoder::new_with_options(
@@ -436,5 +449,28 @@ mod tests {
             assert!(px[2] > 40, "blue channel collapsed: {px:?}");
             assert_eq!(px[3], 255);
         }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// Measure zune-jpeg throughput for a 720p camera frame.
+    #[test]
+    fn mjpeg_720_decode_cost() {
+        let jpg = include_bytes!("../../tests/fixtures/mjpeg_720.jpg");
+        let mut rgba = vec![0u8; 1280 * 720 * 4];
+        let t = std::time::Instant::now();
+        let iters = 20;
+        for _ in 0..iters {
+            let mut dec = zune_jpeg::JpegDecoder::new_with_options(
+                &jpg[..],
+                DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGBA),
+            );
+            dec.decode_into(&mut rgba).expect("decode");
+        }
+        let per = t.elapsed().as_secs_f64() / iters as f64;
+        eprintln!("mjpeg 720p decode: {:.2} ms/frame -> {:.0} fps single-threaded", per * 1e3, 1.0 / per);
     }
 }

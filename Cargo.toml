@@ -17,3 +17,15 @@ v4l = "0.14.0"
 wgpu = "30"
 winit = { version = "0.30", features = ["wayland", "x11"] }
 zune-jpeg = "0.4"
+
+# Third-party crates (zune-jpeg, wgpu, v4l) dominate our runtime cost: a
+# MJPEG 720p decode is ~290 ms in debug vs ~12 ms in release. Keep our own
+# code debuggable (opt-level 0, full assertions) but compile dependencies
+# with optimizations, otherwise `cargo run` looks like a broken camera.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Fast enough for dev iteration, but with incremental compilation kept.
+[profile.dev]
+opt-level = 0
+debug = true

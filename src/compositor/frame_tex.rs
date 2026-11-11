@@ -59,6 +59,11 @@ impl FrameTexture {
         &self.view
     }
 
+    /// Current texture size (the last published frame's dimensions).
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame) {
         if self.width != frame.width || self.height != frame.height {
             self.texture = rgba_texture(

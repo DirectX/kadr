@@ -6,11 +6,15 @@ struct Params {
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
-    cam_rect: vec4<f32>, // x, y, w, h in UV — circle bounds (texture mapping)
+    cam_rect: vec4<f32>, // x, y, w, h in UV — circle bounds
     cam_vis: f32,
     cam_radius: f32, // fraction of canvas height
     cam_border: f32,
     aspect: f32,     // canvas width / height
+    cam_aspect: f32, // camera source width / height (for cover crop)
+    _pad3: f32,
+    _pad4: f32,
+    _pad5: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -49,7 +53,16 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
         let ring_out = r + p.cam_border;
         let ring = smoothstep(r - aa, r + aa, dist)
                  * (1.0 - smoothstep(ring_out - aa, ring_out + aa, dist));
-        let cam_uv = d / p.cam_rect.zw + vec2<f32>(0.5);
+
+        // Cover-crop: the circle is square in screen space, so sample the
+        // centered largest square of the source instead of stretching it.
+        var crop = vec2<f32>(1.0);
+        if (p.cam_aspect > 1.0) {
+            crop.x = 1.0 / p.cam_aspect;
+        } else if (p.cam_aspect > 0.0) {
+            crop.y = p.cam_aspect;
+        }
+        let cam_uv = vec2<f32>(0.5) + d / (p.cam_rect.zw * 0.5) * (crop * 0.5);
         let cam = textureSampleLevel(cam_tex, smp, clamp(cam_uv, vec2(0.002), vec2(0.998)), 0.0);
         color = mix(color, cam, inside);
         color = mix(color, vec4<f32>(1.0, 1.0, 1.0, 1.0), ring * 0.9);

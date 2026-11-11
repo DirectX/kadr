@@ -28,6 +28,11 @@ pub struct GpuScene {
     pub cam_radius: f32,
     pub cam_border: f32,
     pub aspect: f32,
+    /// Source frame aspect (w/h) of the camera texture, for cover-cropping.
+    pub cam_aspect: f32,
+    pub _pad3: f32,
+    pub _pad4: f32,
+    pub _pad5: f32,
 }
 
 pub struct Compositor {
@@ -233,6 +238,7 @@ impl Compositor {
     /// producer of the final frame: all consumers (preview, file, virtual cam) read it.
     pub fn render_scene(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
         let aspect = SCENE_W as f32 / SCENE_H as f32;
+        let (cw, ch) = self.cam.size();
         let params = GpuScene {
             bg_vis: scene.bg_on as u8 as f32,
             _pad0: 0.0,
@@ -243,6 +249,10 @@ impl Compositor {
             cam_radius: scene.current.radius,
             cam_border: scene.current.border,
             aspect,
+            cam_aspect: cw as f32 / ch.max(1) as f32,
+            _pad3: 0.0,
+            _pad4: 0.0,
+            _pad5: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
 
