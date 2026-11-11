@@ -174,7 +174,21 @@ impl Studio {
 
     /// Switch the camera source (0 = test pattern).
     fn set_camera(&mut self, choice: usize) {
+        let alive = matches!(
+            *self.cam_status.lock().unwrap(),
+            CaptureStatus::Running { .. } | CaptureStatus::Starting(_)
+        );
+        if choice == self.cam_choice && (alive || choice == 0) {
+            return; // same live source: hotkey mashing must not restart the stream
+        }
         self.cam_choice = choice;
+        // Release the old source BEFORE spawning the new one so the device
+        // claim frees up immediately (see capture::camera::Claim).
+        let old = std::mem::replace(
+            &mut self.cam_src,
+            Box::new(crate::capture::IdleSource::new()) as Box<dyn FrameSource>,
+        );
+        drop(old);
         if choice == 0 {
             self.cam_src = Box::new(TestPatternSource::start(
                 "camera",

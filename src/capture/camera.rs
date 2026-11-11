@@ -11,6 +11,7 @@
 //! delivers frames wins; a watchdog drops a mode that goes silent.
 
 use super::{Frame, FrameSource, FrameSlot};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -273,6 +274,62 @@ fn attempt(
     }
 }
 
+/// Sleep in small slices so `stop` is honored quickly. A blind sleep kept
+/// the previous thread holding the device fd for seconds after shutdown was
+/// requested — two threads streaming one UVC node corrupts frames (driver
+/// mixes buffer queues; visible as shifted-row green/red streaks).
+fn sleep_or_stop(stop: &AtomicBool, total: Duration) {
+    const SLICE: Duration = Duration::from_millis(50);
+    let deadline = Instant::now() + total;
+    loop {
+        let now = Instant::now();
+        if now >= deadline || stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(SLICE.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// One claim per /dev/videoN: a new capture thread waits for the previous
+/// one to actually exit before opening the device (see sleep_or_stop above).
+static CLAIMED: std::sync::OnceLock<Mutex<HashSet<u32>>> = std::sync::OnceLock::new();
+
+fn claimed() -> &'static Mutex<HashSet<u32>> {
+    CLAIMED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct Claim(u32);
+
+impl Claim {
+    /// Acquire the device claim, waiting (stop-aware) up to `budget` for the
+    /// previous owner to release. Proceeds anyway after the budget — a
+    /// degraded open attempt is better than a dead hotkey.
+    fn acquire(index: u32, stop: &AtomicBool, budget: Duration) -> Option<Self> {
+        let deadline = Instant::now() + budget;
+        loop {
+            {
+                let mut set = claimed().lock().unwrap();
+                if set.insert(index) {
+                    return Some(Claim(index));
+                }
+            }
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                tracing::warn!(index, "device claim unavailable; proceeding anyway");
+                return Some(Claim(u32::MAX)); // a no-op claim
+            }
+            sleep_or_stop(stop, Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.0 != u32::MAX {
+            claimed().lock().unwrap().remove(&self.0);
+        }
+    }
+}
+
 /// Candidate ladder on one node; first mode that streams wins.
 /// Ok(()) = running until stop; Err = last failure description.
 fn ladder(
@@ -320,7 +377,7 @@ fn candidates_for(index: u32) -> Result<Vec<(FourCC, u32, u32)>, String> {
             Err(e) if e.raw_os_error() == Some(16 /* EBUSY */) && i < 7 => {
                 tracing::debug!(index, attempt = i + 1, "device busy, retrying");
                 busy_err = e.to_string();
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_millis(150)); // short; stop-checked each loop
             }
             Err(e) => return Err(format!("open /dev/video{index}: {e}")),
         }
@@ -343,6 +400,17 @@ fn run(
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), String> {
+    // One streaming thread per device. Without this, a fast double hotkey
+    // (1-1) spawns a second thread while the first still holds the fd: two
+    // threads QBUF/DQBUF one UVC node corrupt frame ordering (visible as
+    // shifted-row green/red streaks until STREAMOFF resets the queue).
+    let _claim = match Claim::acquire(index, stop, Duration::from_secs(3)) {
+        Some(c) => c,
+        None => return Err("cancelled while waiting for the device".into()),
+    };
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let cands = candidates_for(index)?;
 
     let err1 = match ladder(index, &cands, stop, slot, status) {
@@ -355,7 +423,10 @@ fn run(
 
     tracing::warn!(index, error = %err1, "selected node failed; cooling down and retrying");
     *status.lock().unwrap() = CaptureStatus::Starting(format!("video{index}: cooldown + retry"));
-    std::thread::sleep(Duration::from_secs(2));
+    sleep_or_stop(stop, Duration::from_secs(2));
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     match candidates_for(index) {
         Ok(c) => match ladder(index, &c, stop, slot, status) {
             Ok(()) => {
@@ -570,5 +641,53 @@ mod bench {
         }
         let per = t.elapsed().as_secs_f64() / iters as f64;
         eprintln!("mjpeg 720p decode: {:.2} ms/frame -> {:.0} fps single-threaded", per * 1e3, 1.0 / per);
+    }
+
+    #[test]
+    fn claim_serializes_device_owners() {
+        // Unique index so this test cannot collide with real devices.
+        const IDX: u32 = 900_001;
+        let stop = AtomicBool::new(false);
+
+        let first = Claim::acquire(IDX, &stop, Duration::from_millis(100)).expect("first claim");
+        assert_eq!(first.0, IDX, "first acquirer owns the device");
+
+        // Second claim must NOT steal: with the first held, it waits out the
+        // budget and degrades to a no-op claim instead of double-opening.
+        let t0 = Instant::now();
+        let second = Claim::acquire(IDX, &stop, Duration::from_millis(150)).expect("second claim");
+        assert_eq!(second.0, u32::MAX, "contended claim is a no-op");
+        assert!(t0.elapsed() >= Duration::from_millis(120), "should have waited");
+
+        // A stop-flagged waiter gives up immediately (hotkey must not hang).
+        let stop2 = AtomicBool::new(true);
+        let t1 = Instant::now();
+        let third = Claim::acquire(IDX, &stop2, Duration::from_secs(5)).expect("third claim");
+        assert_eq!(third.0, u32::MAX);
+        assert!(t1.elapsed() < Duration::from_millis(300), "stop must short-circuit wait");
+
+        // Releasing the owner frees the device for the next claim.
+        drop(second);
+        drop(third);
+        drop(first);
+        let fourth = Claim::acquire(IDX, &stop, Duration::from_millis(100)).expect("fourth claim");
+        assert_eq!(fourth.0, IDX, "claim is reusable after drop");
+        drop(fourth);
+    }
+
+    #[test]
+    fn sleep_or_stop_honors_stop_early() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        std::thread::spawn({
+            let s = stop.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(80));
+                s.store(true, Ordering::Relaxed);
+            }
+        });
+        sleep_or_stop(&stop, Duration::from_secs(10));
+        let el = t0.elapsed();
+        assert!(el < Duration::from_millis(1500), "stop ignored, slept {el:?}");
     }
 }
