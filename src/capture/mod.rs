@@ -9,6 +9,7 @@
 
 pub mod camera;
 pub mod pattern;
+pub mod rig;
 pub mod slot;
 
 pub use pattern::{FrameSource, PatternKind, TestPatternSource};

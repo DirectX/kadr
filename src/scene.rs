@@ -25,6 +25,13 @@ pub struct Layout {
     /// Camera covers the whole canvas (crossfaded, ring hidden).
     pub cam_full: bool,
     pub cam: CamPose,
+    /// Which camera this layer reads, as a CHOICE number (0 = pattern,
+    /// 1..n = device): `None` follows whatever the rig has on air, `Some(c)`
+    /// pins the layer to that source — a "camera angle" preset. This is
+    /// multi-camera as a scene concept: the director cuts between physical
+    /// viewpoints by switching LAYERS, so a cut inherits every scene property
+    /// (dissolve, tween, human-reset) instead of being a capture-side hack.
+    pub cam_src: Option<usize>,
 }
 
 pub const PRESETS: [Layout; 4] = [
@@ -34,6 +41,7 @@ pub const PRESETS: [Layout; 4] = [
         cam_on: true,
         cam_full: false,
         cam: CamPose { x: 0.83, y: 0.79, radius: 0.14, border: 0.007 },
+        cam_src: None,
     },
     Layout {
         name: "спикер",
@@ -41,6 +49,7 @@ pub const PRESETS: [Layout; 4] = [
         cam_on: true,
         cam_full: false,
         cam: CamPose { x: 0.73, y: 0.50, radius: 0.40, border: 0.008 },
+        cam_src: None,
     },
     Layout {
         name: "спикер полный",
@@ -50,6 +59,7 @@ pub const PRESETS: [Layout; 4] = [
         // Radius only matters for the transition shape; the fullscreen
         // blend dominates the final frame.
         cam: CamPose { x: 0.5, y: 0.5, radius: 0.5, border: 0.0 },
+        cam_src: None,
     },
     Layout {
         name: "только экран",
@@ -57,6 +67,7 @@ pub const PRESETS: [Layout; 4] = [
         cam_on: false,
         cam_full: false,
         cam: CamPose { x: 0.83, y: 0.79, radius: 0.0, border: 0.0 },
+        cam_src: None,
     },
 ];
 
@@ -79,6 +90,12 @@ pub struct Scene {
     target: CamPose,
     pub bg_on: bool,
     pub cam_on: bool,
+    /// Which camera this layer reads, as a CHOICE number (0 = pattern,
+    /// 1..n = device) — `None` follows whatever the rig has on air. Written
+    /// by `transition_to`, read by the render loop to pick the feed: cutting
+    /// between physical angles is therefore a scene transition, not a capture
+    /// operation, and inherits every scene property (dissolve, tween, reset).
+    pub cam_src: Option<usize>,
     pub current: CamPose,
     /// Face-tracking pan (source-UV offset), written by the render loop from
     /// the tracker thread's shared state.
@@ -107,6 +124,7 @@ impl Scene {
             target: p.cam,
             bg_on: p.bg_on,
             cam_on: p.cam_on,
+            cam_src: p.cam_src,
             current: p.cam,
             track_offset: [0.0; 2],
             start: Instant::now(),
@@ -126,6 +144,7 @@ impl Scene {
         self.target = l.cam;
         self.bg_on = l.bg_on;
         self.cam_on = l.cam_on;
+        self.cam_src = l.cam_src;
         self.from_bg_alpha = self.bg_alpha;
         self.target_bg_alpha = if l.bg_on { 1.0 } else { 0.0 };
         self.from_cam_full = self.cam_full;

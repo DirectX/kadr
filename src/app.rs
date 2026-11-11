@@ -1,6 +1,7 @@
 //! Application: winit loop, egui side panel, scene preview via PaintCallback.
 
-use crate::capture::camera::{self, CameraInfo, CameraSource, CaptureStatus};
+use crate::capture::camera::CaptureStatus;
+use crate::capture::rig::{Rig, Role};
 use crate::capture::{FrameSlot, FrameSource, PatternKind, TestPatternSource};
 use crate::compositor::{Compositor, SCENE_H, SCENE_W};
 use crate::output::recorder::{self, AudioSource, Recorder, RecorderState};
@@ -10,7 +11,6 @@ use crate::scene;
 use crate::track::FaceTracker;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -75,50 +75,9 @@ struct Stats {
     cam_seq: u64,
 }
 
-/// The camera layer's active source: either the test pattern or a real
-/// v4l2 device (whose `CameraSource` may later be parked into the warm pool).
-enum ActiveSrc {
-    Pattern(TestPatternSource),
-    Camera {
-        device: u32,
-        src: CameraSource,
-        status: Arc<Mutex<CaptureStatus>>,
-    },
-}
-
-impl FrameSource for ActiveSrc {
-    fn slot(&self) -> Arc<FrameSlot> {
-        match self {
-            ActiveSrc::Pattern(p) => p.slot(),
-            ActiveSrc::Camera { src, .. } => src.slot(),
-        }
-    }
-    fn describe(&self) -> String {
-        match self {
-            ActiveSrc::Pattern(p) => p.describe(),
-            ActiveSrc::Camera { src, .. } => src.describe(),
-        }
-    }
-}
-
-/// A parked camera: device stays OPEN, the capture thread keeps draining the
-/// v4l2 queue at standby rate (stream healthy, USB endpoint claimed), but
-/// decode+publish happens only ~5 times per second. Promoting it back to air
-/// is one atomic flip — no reopen, no cold ladder, no black gap.
-struct WarmCam {
-    device: u32,
-    src: CameraSource,
-    status: Arc<Mutex<CaptureStatus>>,
-    /// When this camera was last on air (LRU eviction key).
-    last_used: Instant,
-}
-
-/// How many cameras may sit warm at once. Each costs a drained stream
-/// (~5 fps of MJPEG arrivals, no decode) — cheap on CPU, but the USB
-/// bandwidth and kernel buffer budget are finite. Two covers a typical
-/// "main + desk + side" webinar rig.
-const MAX_WARM: usize = 2;
-
+/// The camera rig (sources, warm pool, slot allocation) lives in
+/// `capture::rig`; the application only decides *which choice* should be on
+/// air and resolves the resulting feed.
 pub struct Studio {
     window: Option<Arc<Window>>,
     egui_state: Option<egui_winit::State>,
@@ -127,19 +86,20 @@ pub struct Studio {
 
     screen: TestPatternSource,
     screen_slot: Arc<FrameSlot>,
-    cam_active: Option<ActiveSrc>,
+    rig: Rig,
+    /// The feed currently wired into the compositor. Compared against the
+    /// rig's resolved slot each frame: a pointer change IS a camera cut,
+    /// which is what arms the dissolve (regardless of who requested it —
+    /// a hotkey, a UI click, or a scene layer pinning an angle).
     cam_slot: Arc<FrameSlot>,
-    cam_devices: Vec<CameraInfo>,
-    /// 0 = test pattern, otherwise index into `cam_devices` + 1.
-    cam_choice: usize,
-    /// Parked cameras (warm standby pool).
-    warm: Vec<WarmCam>,
-    /// Set by set_camera on a real camera cut; draw_frame turns it into a
-    /// compositor dissolve (gfx is only reachable inside the render loop).
-    cut_dissolve: bool,
 
     scene: scene::Scene,
     active_preset: usize,
+    /// Per-preset camera pin (choice number, None = follow the live camera).
+    /// Kept beside the static `PRESETS` table so presets stay immutable:
+    /// applying a preset merges its pin in. This is the user-facing entry to
+    /// multi-camera-as-scene-layer: "this shot always runs on camera 2".
+    preset_pins: Vec<Option<usize>>,
     /// Face tracking (YuNet) toggle; the tracker thread idles when off.
     tracking: bool,
     tracker: FaceTracker,
@@ -180,15 +140,11 @@ pub struct Studio {
 impl Studio {
     pub fn new() -> Self {
         let screen = TestPatternSource::start("screen", PatternKind::Screen, SCENE_W, SCENE_H, 30);
-        let cam_devices = camera::enumerate();
-        let cam_active = Some(ActiveSrc::Pattern(TestPatternSource::start(
-            "camera",
-            PatternKind::Webcam,
-            640,
-            480,
-            30,
-        )));
-        let cam_slot = cam_active.as_ref().unwrap().slot();
+        let mut rig = Rig::new();
+        // Start on the test pattern: no device is opened until the user (or
+        // a scene layer) asks for one.
+        rig.pick(0);
+        let cam_slot = rig.resolve(None);
         let screen_slot = screen.slot();
         Self {
             window: None,
@@ -197,14 +153,11 @@ impl Studio {
             gfx: None,
             screen,
             screen_slot,
-            cam_active,
+            rig,
             cam_slot,
-            cam_devices,
-            cam_choice: 0,
-            warm: Vec::new(),
-            cut_dissolve: false,
             scene: scene::Scene::new(),
             active_preset: 0,
+            preset_pins: vec![None; scene::PRESETS.len()],
             tracking: false,
             tracker: FaceTracker::new(),
             directing: false,
@@ -233,106 +186,79 @@ impl Studio {
         }
     }
 
-    /// Switch the camera source (0 = test pattern) with warm-standby pooling:
-    /// the outgoing camera is PARKED (device stays open, drains at 5 fps),
-    /// the incoming one is promoted from the pool when possible — a flip of
-    /// an atomic, no reopen, no cold ladder.
+    /// Put `choice` on air (0 = test pattern, 1..n = device). The rig parks
+    /// the outgoing camera and promotes the requested one; this method does
+    /// NOT touch the compositor or the tracker — a feed change is detected
+    /// centrally by `sync_cam_feed` in the render loop, so cuts driven by a
+    /// scene layer (camera angle pinned in a preset) behave identically to
+    /// hotkey cuts.
     fn set_camera(&mut self, choice: usize) {
-        if choice == self.cam_choice {
-            // Same source: hotkey mashing must not disturb a live stream.
-            let alive = match &self.cam_active {
-                Some(ActiveSrc::Camera { status, .. }) => matches!(
-                    *status.lock().unwrap(),
-                    CaptureStatus::Running { .. } | CaptureStatus::Starting(_)
-                ),
-                Some(ActiveSrc::Pattern(_)) => true,
-                None => false,
-            };
-            if alive || choice == 0 {
-                return;
-            }
+        use crate::capture::rig::Pick;
+        match self.rig.pick(choice) {
+            Pick::Unchanged => {}
+            Pick::Failed => tracing::warn!(choice, "rig: no slot available"),
+            Pick::Started(_) | Pick::Promoted(_) => {}
         }
-        self.cam_choice = choice;
-        let now = Instant::now();
+        // Choosing a camera unpins the current layer: otherwise an
+        // angle-pinned preset would make the operator's remote dead.
+        self.scene.cam_src = None;
+    }
 
-        // 1. Demote the current camera into the pool (a parked pattern thread
-        //    is simply dropped). No placeholder is spawned in between: the
-        //    previous version did, and every switch leaked a spawn+stop pair
-        //    of test-pattern threads into the log.
-        if let Some(ActiveSrc::Camera { device, src, status }) = self.cam_active.take() {
-            src.set_rate(camera::RATE_STANDBY);
-            if !self.warm.iter().any(|c| c.device == device) {
-                if self.warm.len() >= MAX_WARM {
-                    if let Some(victim) = self
-                        .warm
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, c)| c.last_used)
-                        .map(|(i, _)| i)
-                    {
-                        let dead = self.warm.remove(victim);
-                        tracing::debug!(device = dead.device, "warm pool: evicting LRU camera");
-                        drop(dead); // stop flag -> claim released ~50 ms later
-                    }
-                }
-                self.warm.push(WarmCam { device, src, status, last_used: now });
-            }
+    /// Manual camera input (hotkey/UI): same as `set_camera`, plus the
+    /// director steps back so a human decision is not instantly overridden.
+    fn manual_camera(&mut self, choice: usize) {
+        self.set_camera(choice);
+        self.director_reset();
+    }
+
+    /// Point the compositor at the feed the scene asks for, and react to a
+    /// change: arm the dissolve, retarget the tracker (its smoothing is
+    /// meaningless across viewpoints). Returns nothing — idempotent per frame.
+    fn sync_cam_feed(&mut self, comp: &mut Compositor) {
+        // A layer pinning an angle wins over the manually chosen camera;
+        // None means "follow whatever is on air".
+        let want = self.scene.cam_src;
+        let next = self.rig.resolve(want);
+        if Arc::ptr_eq(&next, &self.cam_slot) {
+            return;
         }
-
-        // 2. Promote the requested camera: from the warm pool (atomic flip)
-        //    or cold. The test pattern is the fallback when the device list
-        //    went stale under us, so cam_active is always Some afterwards.
-        self.cam_active = if choice == 0 {
-            Some(ActiveSrc::Pattern(TestPatternSource::start(
-                "camera",
-                PatternKind::Webcam,
-                640,
-                480,
-                30,
-            )))
-        } else {
-            match self.cam_devices.get(choice - 1).map(|d| d.index) {
-                Some(dev) => match self.warm.iter().position(|c| c.device == dev) {
-                    Some(pos) => {
-                        let mut warm = self.warm.remove(pos);
-                        warm.src.set_rate(camera::RATE_ACTIVE);
-                        warm.last_used = now;
-                        tracing::info!(device = dev, "camera promoted from warm standby");
-                        Some(ActiveSrc::Camera {
-                            device: warm.device,
-                            src: warm.src,
-                            status: warm.status,
-                        })
-                    }
-                    None => {
-                        let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
-                        let src = CameraSource::start(dev, status.clone(), camera::RATE_ACTIVE);
-                        Some(ActiveSrc::Camera { device: dev, src, status })
-                    }
-                },
-                None => Some(ActiveSrc::Pattern(TestPatternSource::start(
-                    "camera",
-                    PatternKind::Webcam,
-                    640,
-                    480,
-                    30,
-                ))),
-            }
-        };
-        self.cam_slot = self.cam_active.as_ref().expect("set_camera always yields a source").slot();
-        // Any real switch gets a soft dissolve (settle below in draw_frame).
-        self.cut_dissolve = true;
-        // Retarget the tracker; it resets its smoothing for the new viewpoint.
+        self.cam_slot = next;
+        comp.mark_dissolve();
         if self.tracking {
             self.tracker.attach(self.cam_slot.clone());
         }
+        tracing::info!(?want, "camera feed switched (dissolve armed)");
     }
 
     fn rescan_cameras(&mut self) {
-        self.cam_devices = camera::enumerate();
-        if self.cam_choice > self.cam_devices.len() {
-            self.set_camera(0);
+        // Choice numbers are POSITIONAL: they shift when the device list
+        // changes. Pins are stored as choices, so a naive rescan would
+        // silently re-point "camera 2" at a different physical device — and
+        // routing through set_camera() would wipe the pins outright. Remap
+        // every pin through the device index instead.
+        let old = self.rig.devices().to_vec();
+        let was_active = self.rig.active_slot().and_then(|i| self.rig.device_of(i));
+        self.rig.rescan();
+        let new = self.rig.devices().to_vec();
+        let choice_of = |dev: u32| -> Option<usize> {
+            new.iter().position(|d| d.index == dev).map(|p| p + 1)
+        };
+        for pin in self.preset_pins.iter_mut() {
+            *pin = match *pin {
+                Some(0) | None => *pin, // pattern has no device identity
+                Some(c) => old.get(c - 1).and_then(|d| choice_of(d.index)),
+            };
         }
+        self.scene.cam_src = match self.scene.cam_src {
+            Some(0) | None => self.scene.cam_src,
+            Some(c) => old.get(c - 1).and_then(|d| choice_of(d.index)),
+        };
+        // Reload the on-air camera: the scene's pin wins, else keep the
+        // physical device that was streaming. Only the RIG is touched here —
+        // sync_cam_feed resolves the scene's wish on the next frame.
+        let want = self.scene.cam_src.or(was_active.and_then(choice_of));
+        self.rig.pick(want.unwrap_or(0));
+        tracing::info!(devices = new.len(), "camera rescan");
     }
 
     /// Toggle face tracking; attaching resets smoothing, detaching zeroes it.
@@ -356,21 +282,46 @@ impl Studio {
             motion: self.motion_smooth,
             face_size: ts.face_size,
             confidence: ts.confidence,
-            cameras: self.cam_devices.len(),
+            cameras: self.rig.devices().len(),
         };
         match self.director.on_input(&ev) {
             Some(crate::director::DirectorCmd::GotoLayout(idx)) => {
-                if let Some(layout) = scene::PRESETS.get(idx) {
-                    let name = layout.name;
-                    self.active_preset = idx;
-                    self.scene.transition_to(layout, 0.6);
-                    tracing::info!(layout = name, "director: cut");
-                }
+                self.apply_preset(idx);
             }
             Some(crate::director::DirectorCmd::SwitchCamera(n)) => self.set_camera(n),
             Some(crate::director::DirectorCmd::SetTracking(on)) => self.set_tracking(on),
             None => {}
         }
+    }
+
+    /// Apply a scene preset: pose tween + its camera pin. A pin is a DEMAND,
+    /// not a hint: if it names a camera the rig does not hold yet, the rig
+    /// starts it (cold) or promotes it (warm). The feed change itself is then
+    /// detected by `sync_cam_feed`, so a preset-driven camera cut dissolves
+    /// exactly like a hotkey cut.
+    fn apply_preset(&mut self, idx: usize) {
+        let Some(layout) = scene::PRESETS.get(idx) else { return };
+        let name = layout.name;
+        let pin = self.preset_pins.get(idx).copied().flatten();
+        self.active_preset = idx;
+        self.scene.transition_to(layout, 0.6);
+        self.scene.cam_src = pin;
+        if let Some(choice) = pin {
+            self.rig.pick(choice);
+        }
+        tracing::info!(layout = name, ?pin, "preset applied");
+    }
+
+    /// Pin/unpin the current preset to a camera choice (0 = pattern).
+    /// Like `apply_preset`, a pin is a demand: the rig loads the camera.
+    fn pin_preset(&mut self, choice: Option<usize>) {
+        let Some(slot) = self.preset_pins.get_mut(self.active_preset) else { return };
+        *slot = choice;
+        self.scene.cam_src = choice;
+        if let Some(c) = choice {
+            self.rig.pick(c);
+        }
+        tracing::info!(preset = scene::PRESETS[self.active_preset].name, ?choice, "preset pin changed");
     }
 
     /// Manual input takes over: pause the director's montage so it does not
@@ -392,11 +343,10 @@ impl Studio {
 
     /// Hotkeys 1..9 switch camera sources (the manual-director remote).
     fn hotkey_camera(&mut self, number: usize) {
-        if number <= self.cam_devices.len() {
-            self.set_camera(number);
-            self.director_reset();
-            let name = self.cam_devices.get(number.saturating_sub(1)).map(|d| d.card.as_str()).unwrap_or("?");
+        if number <= self.rig.devices().len() {
+            let name = self.rig.devices().get(number - 1).map(|d| d.card.as_str()).unwrap_or("?");
             tracing::info!(slot = number, name, "hotkey: camera switch");
+            self.manual_camera(number);
         }
     }
 
@@ -428,18 +378,30 @@ impl Studio {
                 );
                 ui.separator();
                 ui.label("camera");
+                let active_choice = self.rig.active_choice();
+                // A layer-pinned angle overrides the manual choice for the
+                // compositor; show it so the operator is never surprised.
+                let pinned = self.scene.cam_src;
                 egui::ScrollArea::vertical()
                     .max_height(96.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        let pin_mark = |c: usize, mark: &str| -> String {
+                            if pinned == Some(c) {
+                                format!("{mark}◈")
+                            } else {
+                                String::new()
+                            }
+                        };
                         if ui
-                            .selectable_label(self.cam_choice == 0, "тест-паттерн")
+                            .selectable_label(active_choice == 0, format!("тест-паттерн{}", pin_mark(0, "")))
                             .clicked()
                         {
-                            self.set_camera(0);
+                            self.manual_camera(0);
                         }
                         let choices: Vec<(usize, String, String)> = self
-                            .cam_devices
+                            .rig
+                            .devices()
                             .iter()
                             .enumerate()
                             .map(|(i, d)| {
@@ -451,41 +413,39 @@ impl Studio {
                             })
                             .collect();
                         for (idx, label, tooltip) in choices {
-                            // Suffix: which slot this camera occupies in the rig.
-                            let dev = self.cam_devices.get(idx - 1).map(|d| d.index);
-                            let is_active = matches!(
-                                (self.cam_active.as_ref(), dev),
-                                (Some(ActiveSrc::Camera { device, .. }), Some(d)) if *device == d
-                            );
-                            let is_warm = dev.is_some_and(|d| self.warm.iter().any(|c| c.device == d));
-                            let suffix = if is_active {
-                                "  ⦿"
-                            } else if is_warm {
-                                "  ♨"
-                            } else {
-                                ""
+                            // Role marker: ⦿ on air, ♨ warm (device open).
+                            let role = self.rig.role_of_choice(idx);
+                            let suffix = match role {
+                                Some(Role::Active) => "  ⦿",
+                                Some(Role::Warm) => "  ♨",
+                                _ => "",
                             };
-                            let tip = if is_warm {
-                                format!("{tooltip}\n\n♨ тёплая: устройство открыто, рез мгновенный")
-                            } else {
-                                tooltip
+                            let tip = match role {
+                                Some(Role::Warm) => {
+                                    format!("{tooltip}\n\n♨ тёплая: устройство открыто, рез мгновенный")
+                                }
+                                Some(Role::Active) if pinned == Some(idx) => {
+                                    format!("{tooltip}\n\n◈ закреплена слоем сцены (рез через наплыв)")
+                                }
+                                _ => tooltip,
                             };
+                            let is_pin = pinned == Some(idx);
                             if ui
-                                .selectable_label(self.cam_choice == idx, format!("{label}{suffix}"))
+                                .selectable_label(
+                                    active_choice == idx,
+                                    format!("{label}{suffix}{}", if is_pin { "  ◈" } else { "" }),
+                                )
                                 .on_hover_text(tip)
                                 .clicked()
                             {
-                                self.set_camera(idx);
+                                self.manual_camera(idx);
                             }
                         }
                     });
                 if ui.small_button("↻ найти заново").clicked() {
                     self.rescan_cameras();
                 }
-                let status = match self.cam_active.as_ref() {
-                    Some(ActiveSrc::Camera { status, .. }) => Some(status.lock().unwrap().clone()),
-                    Some(ActiveSrc::Pattern(_)) | None => None,
-                };
+                let status = self.rig.status_of_choice(active_choice);
                 let (txt, color) = match status.as_ref() {
                     Some(CaptureStatus::Starting(msg)) => (
                         if msg.is_empty() { "запуск…".to_string() } else { format!("пробую {msg}…") },
@@ -497,14 +457,18 @@ impl Studio {
                     None => ("тест-паттерн".into(), egui::Color32::GRAY),
                 };
                 ui.label(egui::RichText::new(txt).small().color(color));
-                if !self.warm.is_empty() {
-                    let list: Vec<String> = self
-                        .warm
-                        .iter()
-                        .map(|c| format!("video{}", c.device))
-                        .collect();
+                let warm: Vec<String> = self
+                    .rig
+                    .occupied()
+                    .filter(|(_, role, _, _)| *role == Role::Warm)
+                    .map(|(i, _, dev, _)| match dev {
+                        Some(d) => format!("video{d} (slot {i})"),
+                        None => format!("паттерн (slot {i})"),
+                    })
+                    .collect();
+                if !warm.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("♨ тёплые: {}", list.join(", ")))
+                        egui::RichText::new(format!("♨ тёплые: {}", warm.join(", ")))
                             .small()
                             .color(egui::Color32::from_rgb(120, 190, 220)),
                     );
@@ -515,15 +479,56 @@ impl Studio {
             ui.group(|ui| {
                 ui.label("Сцена");
                 for (idx, layout) in scene::PRESETS.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.active_preset == idx, layout.name)
-                        .clicked()
-                    {
-                        self.active_preset = idx;
-                        self.scene.transition_to(layout, 0.6);
+                    let pin = self.preset_pins.get(idx).copied().flatten();
+                    let mark = match pin {
+                        Some(c) if c == 0 => " ▣",
+                        Some(_) => " ◈",
+                        None => "",
+                    };
+                    let label = if self.active_preset == idx {
+                        format!("{}{mark}", layout.name)
+                    } else {
+                        layout.name.to_string() + if pin.is_some() { mark } else { "" }
+                    };
+                    if ui.selectable_label(self.active_preset == idx, label).clicked() {
+                        self.apply_preset(idx);
                         self.director_reset(); // manual decision wins
                     }
                 }
+                // Pin the CURRENT preset to a camera: multi-camera as a scene
+                // layer. ◈ = pinned to a device, ▣ = pinned to the pattern,
+                // nothing = follows whatever is on air.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("камера слоя:").small().weak());
+                    let cur = self.active_preset;
+                    let pin = self.preset_pins.get(cur).copied().flatten();
+                    if ui
+                        .small_button(if pin.is_none() { "авто •" } else { "авто" })
+                        .clicked()
+                    {
+                        self.pin_preset(None);
+                    }
+                    if ui
+                        .small_button(if pin == Some(0) { "паттерн •" } else { "паттерн" })
+                        .clicked()
+                    {
+                        self.pin_preset(Some(0));
+                    }
+                    let n = self.rig.devices().len();
+                    for c in 1..=n {
+                        let on = pin == Some(c);
+                        let name = self
+                            .rig
+                            .devices()
+                            .get(c - 1)
+                            .map(|d| d.card.clone())
+                            .unwrap_or_else(|| format!("камера {c}"));
+                        let short: String = name.chars().take(10).collect();
+                        if ui.small_button(if on { format!("{short} •") } else { short }).clicked() {
+                            self.pin_preset(Some(c));
+                        }
+                    }
+                });
                 ui.separator();
                 let mut dr = self.directing;
                 if ui.checkbox(&mut dr, "авторежиссёр (метроном)").changed() {
@@ -793,14 +798,13 @@ impl Studio {
         let mut painter = self.painter.take().unwrap();
         let mut gfx = self.gfx.take().unwrap();
 
+        // Wire the feed the scene asks for BEFORE uploading: a scene layer
+        // pinning an angle must reach the compositor in the same frame.
+        self.sync_cam_feed(&mut gfx.compositor);
         gfx.compositor.update_sources(&gfx.device, &gfx.queue, &self.screen_slot, &self.cam_slot);
         self.scene.advance();
         if self.tracking {
             self.scene.track_offset = self.tracker.state().offset;
-        }
-        if self.cut_dissolve {
-            gfx.compositor.mark_dissolve();
-            self.cut_dissolve = false;
         }
         self.director_tick();
         gfx.compositor.render_scene(&self.scene);
