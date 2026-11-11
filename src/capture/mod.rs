@@ -11,27 +11,5 @@ pub mod camera;
 pub mod pattern;
 pub mod slot;
 
-use std::sync::Arc;
-
 pub use pattern::{FrameSource, PatternKind, TestPatternSource};
 pub use slot::{Frame, FrameSlot};
-
-/// A source that publishes nothing (placeholder during camera swaps).
-pub struct IdleSource {
-    slot: Arc<FrameSlot>,
-}
-
-impl IdleSource {
-    pub fn new() -> Self {
-        Self { slot: Arc::new(FrameSlot::new()) }
-    }
-}
-
-impl FrameSource for IdleSource {
-    fn slot(&self) -> Arc<FrameSlot> {
-        self.slot.clone()
-    }
-    fn describe(&self) -> String {
-        "idle".into()
-    }
-}

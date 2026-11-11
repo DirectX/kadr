@@ -75,6 +75,50 @@ struct Stats {
     cam_seq: u64,
 }
 
+/// The camera layer's active source: either the test pattern or a real
+/// v4l2 device (whose `CameraSource` may later be parked into the warm pool).
+enum ActiveSrc {
+    Pattern(TestPatternSource),
+    Camera {
+        device: u32,
+        src: CameraSource,
+        status: Arc<Mutex<CaptureStatus>>,
+    },
+}
+
+impl FrameSource for ActiveSrc {
+    fn slot(&self) -> Arc<FrameSlot> {
+        match self {
+            ActiveSrc::Pattern(p) => p.slot(),
+            ActiveSrc::Camera { src, .. } => src.slot(),
+        }
+    }
+    fn describe(&self) -> String {
+        match self {
+            ActiveSrc::Pattern(p) => p.describe(),
+            ActiveSrc::Camera { src, .. } => src.describe(),
+        }
+    }
+}
+
+/// A parked camera: device stays OPEN, the capture thread keeps draining the
+/// v4l2 queue at standby rate (stream healthy, USB endpoint claimed), but
+/// decode+publish happens only ~5 times per second. Promoting it back to air
+/// is one atomic flip — no reopen, no cold ladder, no black gap.
+struct WarmCam {
+    device: u32,
+    src: CameraSource,
+    status: Arc<Mutex<CaptureStatus>>,
+    /// When this camera was last on air (LRU eviction key).
+    last_used: Instant,
+}
+
+/// How many cameras may sit warm at once. Each costs a drained stream
+/// (~5 fps of MJPEG arrivals, no decode) — cheap on CPU, but the USB
+/// bandwidth and kernel buffer budget are finite. Two covers a typical
+/// "main + desk + side" webinar rig.
+const MAX_WARM: usize = 2;
+
 pub struct Studio {
     window: Option<Arc<Window>>,
     egui_state: Option<egui_winit::State>,
@@ -83,12 +127,13 @@ pub struct Studio {
 
     screen: TestPatternSource,
     screen_slot: Arc<FrameSlot>,
-    cam_src: Box<dyn FrameSource>,
+    cam_active: ActiveSrc,
     cam_slot: Arc<FrameSlot>,
     cam_devices: Vec<CameraInfo>,
     /// 0 = test pattern, otherwise index into `cam_devices` + 1.
     cam_choice: usize,
-    cam_status: Arc<Mutex<CaptureStatus>>,
+    /// Parked cameras (warm standby pool).
+    warm: Vec<WarmCam>,
 
     scene: scene::Scene,
     active_preset: usize,
@@ -133,17 +178,14 @@ impl Studio {
     pub fn new() -> Self {
         let screen = TestPatternSource::start("screen", PatternKind::Screen, SCENE_W, SCENE_H, 30);
         let cam_devices = camera::enumerate();
-        let cam_status = Arc::new(Mutex::new(CaptureStatus::Running {
-            desc: "test pattern".into(),
-        }));
-        let cam_src: Box<dyn FrameSource> = Box::new(TestPatternSource::start(
+        let cam_active = ActiveSrc::Pattern(TestPatternSource::start(
             "camera",
             PatternKind::Webcam,
             640,
             480,
             30,
         ));
-        let cam_slot = cam_src.slot();
+        let cam_slot = cam_active.slot();
         let screen_slot = screen.slot();
         Self {
             window: None,
@@ -152,11 +194,11 @@ impl Studio {
             gfx: None,
             screen,
             screen_slot,
-            cam_src,
+            cam_active,
             cam_slot,
             cam_devices,
             cam_choice: 0,
-            cam_status,
+            warm: Vec::new(),
             scene: scene::Scene::new(),
             active_preset: 0,
             tracking: false,
@@ -187,43 +229,90 @@ impl Studio {
         }
     }
 
-    /// Switch the camera source (0 = test pattern).
+    /// Switch the camera source (0 = test pattern) with warm-standby pooling:
+    /// the outgoing camera is PARKED (device stays open, drains at 5 fps),
+    /// the incoming one is promoted from the pool when possible — a flip of
+    /// an atomic, no reopen, no cold ladder.
     fn set_camera(&mut self, choice: usize) {
-        let alive = matches!(
-            *self.cam_status.lock().unwrap(),
-            CaptureStatus::Running { .. } | CaptureStatus::Starting(_)
-        );
-        if choice == self.cam_choice && (alive || choice == 0) {
-            return; // same live source: hotkey mashing must not restart the stream
+        if choice == self.cam_choice {
+            // Same source: hotkey mashing must not disturb a live stream.
+            let alive = match &self.cam_active {
+                ActiveSrc::Camera { status, .. } => matches!(
+                    *status.lock().unwrap(),
+                    CaptureStatus::Running { .. } | CaptureStatus::Starting(_)
+                ),
+                ActiveSrc::Pattern(_) => true,
+            };
+            if alive || choice == 0 {
+                return;
+            }
         }
         self.cam_choice = choice;
-        // Release the old source BEFORE spawning the new one so the device
-        // claim frees up immediately (see capture::camera::Claim).
-        let old = std::mem::replace(
-            &mut self.cam_src,
-            Box::new(crate::capture::IdleSource::new()) as Box<dyn FrameSource>,
-        );
-        drop(old);
+        let now = Instant::now();
+
+        // 1. Demote the current camera into the pool (or drop the pattern).
+        let demoted = match std::mem::replace(
+            &mut self.cam_active,
+            ActiveSrc::Pattern(TestPatternSource::start(
+                "camera",
+                PatternKind::Webcam,
+                640,
+                480,
+                30,
+            )),
+        ) {
+            ActiveSrc::Camera { device, src, status } => {
+                src.set_rate(camera::RATE_STANDBY);
+                Some(WarmCam { device, src, status, last_used: now })
+            }
+            ActiveSrc::Pattern(_) => None,
+        };
+        if let Some(w) = demoted {
+            // Evict the least recently used warm camera if the pool is full.
+            if self.warm.iter().any(|c| c.device == w.device) {
+                // already parked (shouldn't happen; keep pool sane anyway)
+            } else {
+                if self.warm.len() >= MAX_WARM {
+                    if let Some(victim) = self.warm.iter().enumerate()
+                        .min_by_key(|(_, c)| c.last_used)
+                        .map(|(i, _)| i)
+                    {
+                        let dead = self.warm.remove(victim);
+                        tracing::debug!(device = dead.device, "warm pool: evicting LRU camera");
+                        drop(dead); // stop flag -> claim released ~50 ms later
+                    }
+                }
+                self.warm.push(w);
+            }
+        }
+
+        // 2. Promote the requested camera, from warm pool or cold start.
         if choice == 0 {
-            self.cam_src = Box::new(TestPatternSource::start(
+            self.cam_active = ActiveSrc::Pattern(TestPatternSource::start(
                 "camera",
                 PatternKind::Webcam,
                 640,
                 480,
                 30,
             ));
-            *self.cam_status.lock().unwrap() = CaptureStatus::Running {
-                desc: "test pattern".into(),
-            };
-        } else {
-            let idx = self.cam_devices.get(choice - 1).map(|d| d.index);
-            if let Some(index) = idx {
+        } else if let Some(dev) = self.cam_devices.get(choice - 1).map(|d| d.index) {
+            if let Some(pos) = self.warm.iter().position(|c| c.device == dev) {
+                let mut warm = self.warm.remove(pos);
+                warm.src.set_rate(camera::RATE_ACTIVE);
+                warm.last_used = now;
+                tracing::info!(device = dev, "camera promoted from warm standby");
+                self.cam_active = ActiveSrc::Camera {
+                    device: warm.device,
+                    src: warm.src,
+                    status: warm.status,
+                };
+            } else {
                 let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
-                self.cam_src = Box::new(CameraSource::start(index, status.clone()));
-                self.cam_status = status;
+                let src = CameraSource::start(dev, status.clone(), camera::RATE_ACTIVE);
+                self.cam_active = ActiveSrc::Camera { device: dev, src, status };
             }
         }
-        self.cam_slot = self.cam_src.slot();
+        self.cam_slot = self.cam_active.slot();
         // Retarget the tracker; it resets its smoothing for the new viewpoint.
         if self.tracking {
             self.tracker.attach(self.cam_slot.clone());
@@ -353,9 +442,28 @@ impl Studio {
                             })
                             .collect();
                         for (idx, label, tooltip) in choices {
+                            // Suffix: which slot this camera occupies in the rig.
+                            let dev = self.cam_devices.get(idx - 1).map(|d| d.index);
+                            let is_active = matches!(
+                                (&self.cam_active, dev),
+                                (ActiveSrc::Camera { device, .. }, Some(d)) if *device == d
+                            );
+                            let is_warm = dev.is_some_and(|d| self.warm.iter().any(|c| c.device == d));
+                            let suffix = if is_active {
+                                "  ⦿"
+                            } else if is_warm {
+                                "  ♨"
+                            } else {
+                                ""
+                            };
+                            let tip = if is_warm {
+                                format!("{tooltip}\n\n♨ тёплая: устройство открыто, рез мгновенный")
+                            } else {
+                                tooltip
+                            };
                             if ui
-                                .selectable_label(self.cam_choice == idx, label)
-                                .on_hover_text(tooltip)
+                                .selectable_label(self.cam_choice == idx, format!("{label}{suffix}"))
+                                .on_hover_text(tip)
                                 .clicked()
                             {
                                 self.set_camera(idx);
@@ -365,17 +473,33 @@ impl Studio {
                 if ui.small_button("↻ найти заново").clicked() {
                     self.rescan_cameras();
                 }
-                let status = self.cam_status.lock().unwrap().clone();
-                let (txt, color) = match &status {
-                    CaptureStatus::Starting(msg) => (
+                let status = match &self.cam_active {
+                    ActiveSrc::Camera { status, .. } => Some(status.lock().unwrap().clone()),
+                    ActiveSrc::Pattern(_) => None,
+                };
+                let (txt, color) = match status.as_ref() {
+                    Some(CaptureStatus::Starting(msg)) => (
                         if msg.is_empty() { "запуск…".to_string() } else { format!("пробую {msg}…") },
                         egui::Color32::GOLD,
                     ),
-                    CaptureStatus::Running { desc } => (desc.clone(), egui::Color32::from_rgb(140, 220, 140)),
-                    CaptureStatus::Error(e) => (e.clone(), egui::Color32::from_rgb(230, 110, 110)),
-                    CaptureStatus::Stopped => ("остановлена".into(), egui::Color32::GRAY),
+                    Some(CaptureStatus::Running { desc }) => (desc.clone(), egui::Color32::from_rgb(140, 220, 140)),
+                    Some(CaptureStatus::Error(e)) => (e.clone(), egui::Color32::from_rgb(230, 110, 110)),
+                    Some(CaptureStatus::Stopped) => ("остановлена".into(), egui::Color32::GRAY),
+                    None => ("тест-паттерн".into(), egui::Color32::GRAY),
                 };
                 ui.label(egui::RichText::new(txt).small().color(color));
+                if !self.warm.is_empty() {
+                    let list: Vec<String> = self
+                        .warm
+                        .iter()
+                        .map(|c| format!("video{}", c.device))
+                        .collect();
+                    ui.label(
+                        egui::RichText::new(format!("♨ тёплые: {}", list.join(", ")))
+                            .small()
+                            .color(egui::Color32::from_rgb(120, 190, 220)),
+                    );
+                }
             });
             ui.add_space(6.0);
 

@@ -9,10 +9,17 @@
 //! Cameras routinely *offer* modes they cannot sustain. So the capture thread
 //! walks a candidate ladder (fourcc x size), and the first mode that actually
 //! delivers frames wins; a watchdog drops a mode that goes silent.
+//!
+//! Warm standby: every source carries a live rate knob (`Arc<AtomicU8>`).
+//! The active camera streams at RATE_ACTIVE fps; standby sources keep the
+//! device OPEN and keep draining the v4l2 queue (stream stays healthy, USB
+//! endpoint stays claimed) but skip the expensive decode+publish at
+//! RATE_STANDBY. Cutting to a warm camera is then an atomic flip — no
+//! reopen, no cold ladder, no black gap on air.
 
 use super::{Frame, FrameSource, FrameSlot};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +32,11 @@ use v4l::video::traits::Capture;
 use v4l::Device;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
+
+/// Streaming roles for the warm-standby rig: the camera on air decodes and
+/// publishes at RATE_ACTIVE; parked cameras drain at RATE_STANDBY.
+pub const RATE_ACTIVE: u8 = 30;
+pub const RATE_STANDBY: u8 = 5;
 
 const SIZES: [(u32, u32); 4] = [(1280, 720), (960, 540), (640, 480), (320, 240)];
 /// No frame at all within this budget -> mode is dead, fall back.
@@ -161,6 +173,7 @@ fn attempt(
     stop: &AtomicBool,
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
+    rate: &AtomicU8,
 ) -> Result<(), String> {
     // Reopen per attempt: fresh fd, clean buffer/queue state.
     let dev = Device::new(index as usize).map_err(|e| format!("OPEN: {e}"))?;
@@ -189,7 +202,10 @@ fn attempt(
     let mut frames = 0u64;
     let mut rgba = vec![0u8; npix * 4];
     let mut last_frame = Instant::now();
-    // Throughput diagnostics: report the real delivered rate periodically.
+    // Publishing throttle (warm standby): arrivals keep the watchdog alive,
+    // only decode+publish passes the rate gate.
+    let mut last_publish = Instant::now() - Duration::from_secs(1);
+    // Throughput diagnostics: published frames per window.
     let mut rate_window = Instant::now();
     let mut rate_frames = 0u64;
 
@@ -201,11 +217,23 @@ fn attempt(
         match stream.next() {
             Ok((data, meta)) => {
                 frames += 1;
-                rate_frames += 1;
+                last_frame = Instant::now();
+                // Status reflects the STREAM, not the publishing: a standby
+                // camera is running fine, it just decodes rarely.
                 if frames == 1 {
                     tracing::info!(%desc, "camera running");
                     *status.lock().unwrap() = CaptureStatus::Running { desc: desc.clone() };
                 }
+
+                // Rate gate (warm standby): drain the queue without paying
+                // for decode. The flip to active takes effect on the next
+                // frame — no reopen, no ladder, no black gap.
+                let gate = Duration::from_secs_f32(1.0 / rate.load(Ordering::Relaxed).max(1) as f32);
+                if last_publish.elapsed() < gate {
+                    continue;
+                }
+                last_publish = Instant::now();
+                rate_frames += 1;
                 if rate_window.elapsed() > Duration::from_secs(2) {
                     let fps = rate_frames as f64 / rate_window.elapsed().as_secs_f64();
                     tracing::info!(%desc, fps = format!("{fps:.1}"), "camera throughput");
@@ -227,7 +255,6 @@ fn attempt(
                     if let Err(e) = dec.decode_into(&mut rgba) {
                         // Corrupt/truncated frame: skip it, keep the mode.
                         tracing::debug!(error = ?e, "mjpeg frame skipped");
-                        last_frame = Instant::now();
                         continue;
                     }
                 } else if let Err(e) = convert(fcc, fmt.width, fmt.height, &data[..n], &mut rgba) {
@@ -241,7 +268,6 @@ fn attempt(
                     seq,
                     data: std::mem::take(&mut rgba),
                 });
-                last_frame = Instant::now();
             }
             Err(e) if matches!(
                 e.kind(),
@@ -338,6 +364,7 @@ fn ladder(
     stop: &AtomicBool,
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
+    rate: &AtomicU8,
 ) -> Result<(), String> {
     let total = cands.len();
     let mut last_err = String::from("no attempt ran");
@@ -351,7 +378,7 @@ fn ladder(
             n + 1
         );
         *status.lock().unwrap() = CaptureStatus::Starting(what.clone());
-        match attempt(index, *fcc, *w, *h, stop, slot, status) {
+        match attempt(index, *fcc, *w, *h, stop, slot, status, rate) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(mode = %what, error = %e, "camera mode failed, falling back");
@@ -399,6 +426,7 @@ fn run(
     stop: &AtomicBool,
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
+    rate: &AtomicU8,
 ) -> Result<(), String> {
     // One streaming thread per device. Without this, a fast double hotkey
     // (1-1) spawns a second thread while the first still holds the fd: two
@@ -413,7 +441,7 @@ fn run(
     }
     let cands = candidates_for(index)?;
 
-    let err1 = match ladder(index, &cands, stop, slot, status) {
+    let err1 = match ladder(index, &cands, stop, slot, status, rate) {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
@@ -428,7 +456,7 @@ fn run(
         return Ok(());
     }
     match candidates_for(index) {
-        Ok(c) => match ladder(index, &c, stop, slot, status) {
+        Ok(c) => match ladder(index, &c, stop, slot, status, rate) {
             Ok(()) => {
                 tracing::info!(index, "camera came up on retry");
                 return Ok(());
@@ -443,12 +471,19 @@ fn run(
         return Ok(());
     }
 
-    // Pass 3: probe sibling nodes.
-    let siblings: Vec<u32> = enumerate()
-        .into_iter()
-        .filter(|d| d.index != index)
-        .map(|d| d.index)
-        .collect();
+    // Pass 3: probe sibling nodes (BRIO re-enumeration moves the live
+    // streaming interface). In a warm rig other pool members legitimately
+    // own sibling nodes — stealing one would silently swap a DIFFERENT
+    // physical camera in, so claimed nodes are skipped: predictability
+    // beats cleverness.
+    let siblings: Vec<u32> = {
+        let held = claimed().lock().unwrap();
+        enumerate()
+            .into_iter()
+            .filter(|d| d.index != index && !held.contains(&d.index))
+            .map(|d| d.index)
+            .collect()
+    };
     for sib in siblings {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -457,7 +492,7 @@ fn run(
         tracing::info!(selected = index, trying = sib, "probing sibling capture node");
         *status.lock().unwrap() =
             CaptureStatus::Starting(format!("video{sib} (заменяет video{index})"));
-        match ladder(sib, &c, stop, slot, status) {
+        match ladder(sib, &c, stop, slot, status, rate) {
             Ok(()) => {
                 tracing::info!(sib, selected = index, "camera came up on a sibling node");
                 return Ok(());
@@ -474,18 +509,21 @@ fn run(
 pub struct CameraSource {
     stop: Arc<AtomicBool>,
     slot: Arc<FrameSlot>,
+    rate: Arc<AtomicU8>,
     label: String,
 }
 
 impl CameraSource {
-    /// Spawns the capture thread. Errors are reported via `status`; on failure
-    /// the slot simply stays empty (the compositor keeps its placeholder).
-    pub fn start(index: u32, status: Arc<Mutex<CaptureStatus>>) -> Self {
+    /// Spawns the capture thread at `rate` (RATE_ACTIVE on air, RATE_STANDBY
+    /// when parked). Errors are reported via `status`; on failure the slot
+    /// simply stays empty (the compositor keeps its placeholder).
+    pub fn start(index: u32, status: Arc<Mutex<CaptureStatus>>, rate: u8) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(FrameSlot::new());
-        let (stop_c, slot_c) = (stop.clone(), slot.clone());
+        let rate = Arc::new(AtomicU8::new(rate));
+        let (stop_c, slot_c, rate_c) = (stop.clone(), slot.clone(), rate.clone());
         thread::spawn(move || {
-            let result = run(index, &stop_c, &slot_c, &status);
+            let result = run(index, &stop_c, &slot_c, &status, &rate_c);
             match result {
                 Ok(()) => *status.lock().unwrap() = CaptureStatus::Stopped,
                 Err(e) => {
@@ -497,8 +535,21 @@ impl CameraSource {
         Self {
             stop,
             slot,
+            rate,
             label: format!("V4L2 /dev/video{index}"),
         }
+    }
+
+    /// Flip the streaming role. Instant: the capture thread reads the knob on
+    /// its next frame — this is what makes cutting to a warm camera free.
+    pub fn set_rate(&self, rate: u8) {
+        self.rate.store(rate, Ordering::Relaxed);
+    }
+
+    /// Current role (diagnostics/UI): RATE_ACTIVE on air, RATE_STANDBY parked.
+    #[allow(dead_code)]
+    pub fn rate(&self) -> u8 {
+        self.rate.load(Ordering::Relaxed)
     }
 }
 
@@ -649,6 +700,34 @@ mod tests {
         let fourth = Claim::acquire(IDX, &stop, Duration::from_millis(100)).expect("fourth claim");
         assert_eq!(fourth.0, IDX, "claim is reusable after drop");
         drop(fourth);
+    }
+
+    #[test]
+    fn rate_knob_flips_without_restart() {
+        // Device 999999 does not exist: the thread will fail, but the knob
+        // itself must flip instantly — that is what promotion relies on.
+        let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
+        let src = CameraSource::start(999_999, status, RATE_ACTIVE);
+        assert_eq!(src.rate(), RATE_ACTIVE);
+        src.set_rate(RATE_STANDBY);
+        assert_eq!(src.rate(), RATE_STANDBY);
+        drop(src); // stop flag fires, thread exits with Error status
+    }
+
+    #[test]
+    fn claimed_set_blocks_sibling_probing() {
+        // The sibling-recovery pass must never steal a node owned by
+        // another warm pool member (that would swap a different physical
+        // camera in silently). Verify the set semantics the filter uses.
+        const IDX: u32 = 900_002;
+        let stop = AtomicBool::new(false);
+        let claim = Claim::acquire(IDX, &stop, Duration::from_millis(100)).unwrap();
+        let held = claimed().lock().unwrap();
+        assert!(held.contains(&IDX), "owner appears in the claimed set");
+        drop(held);
+        drop(claim);
+        let held = claimed().lock().unwrap();
+        assert!(!held.contains(&IDX), "released claim disappears");
     }
 
     #[test]
