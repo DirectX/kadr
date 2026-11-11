@@ -3,7 +3,8 @@
 use crate::capture::camera::{self, CameraInfo, CameraSource, CaptureStatus};
 use crate::capture::{FrameSlot, FrameSource, PatternKind, TestPatternSource};
 use crate::compositor::{Compositor, SCENE_H, SCENE_W};
-use crate::output::{RecorderStub, VirtualCamStub};
+use crate::output::recorder::{self, AudioSource, Recorder, RecorderState};
+use crate::output::VirtualCamStub;
 use crate::scene;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -85,7 +86,9 @@ pub struct Studio {
 
     scene: scene::Scene,
     active_preset: usize,
-    recorder: RecorderStub,
+    recorder: Recorder,
+    audio_sources: Vec<AudioSource>,
+    audio_choice: usize,
     vcam: VirtualCamStub,
     stats: Stats,
 
@@ -93,6 +96,10 @@ pub struct Studio {
     /// (layout self-check during window resizes).
     debug: bool,
     dbg_tick: u64,
+    /// KADR_AUTO_RECORD=N: start recording at frame ~1 and stop after N
+    /// seconds (end-to-end self-test without a UI click).
+    auto_record: Option<u64>,
+    auto_record_done: bool,
     /// Last size reported to `Painter::on_window_resized`. On GNOME/Wayland a
     /// programmatic resize updates `Window::inner_size()` without emitting
     /// `WindowEvent::Resized`, so the size is polled every frame (see draw_frame).
@@ -129,11 +136,17 @@ impl Studio {
             cam_status,
             scene: scene::Scene::new(),
             active_preset: 0,
-            recorder: RecorderStub::new(),
+            recorder: Recorder::new(),
+            audio_sources: recorder::list_audio_sources(),
+            audio_choice: 0,
             vcam: VirtualCamStub::new(),
             stats: Stats::default(),
             debug: std::env::var("KADR_RESIZE_TEST").is_ok(),
             dbg_tick: 0,
+            auto_record: std::env::var("KADR_AUTO_RECORD")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            auto_record_done: false,
             last_surface_size: (0, 0),
         }
     }
@@ -263,13 +276,78 @@ impl Studio {
 
             ui.group(|ui| {
                 ui.label("Выходы");
-                let mut rec = self.recorder.active;
-                if ui.checkbox(&mut rec, "запись в файл (stub)").changed() {
-                    if rec {
-                        self.recorder.start();
-                    } else {
+                let running = self.recorder.is_active();
+                if !running {
+                    let labels: Vec<String> =
+                        self.audio_sources.iter().map(|a| a.label()).collect();
+                    let sel = self
+                        .audio_sources
+                        .get(self.audio_choice)
+                        .map(|a| a.label())
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("audio-src")
+                        .selected_text(format!("звук: {sel}"))
+                        .show_ui(ui, |ui| {
+                            for (i, l) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut self.audio_choice, i, l);
+                            }
+                        });
+                }
+                let btn = if running {
+                    egui::Button::new(egui::RichText::new("■ стоп").color(egui::Color32::from_rgb(230, 90, 90)))
+                } else {
+                    egui::Button::new(egui::RichText::new("● запись в файл").color(egui::Color32::from_rgb(230, 90, 90)))
+                };
+                if ui.add(btn).clicked() {
+                    if running {
                         self.recorder.stop();
+                    } else {
+                        let audio = self
+                            .audio_sources
+                            .get(self.audio_choice)
+                            .cloned()
+                            .unwrap_or(AudioSource::Default);
+                        self.recorder
+                            .start(recorder::default_output_path(), audio, (SCENE_W, SCENE_H), 30);
                     }
+                }
+                match self.recorder.state() {
+                    RecorderState::Starting { path } => {
+                        ui.label(
+                            egui::RichText::new(format!("запуск ffmpeg… {}", path.display()))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    RecorderState::Running { frames, dropped, .. } => {
+                        if let Some(t) = self.recorder.elapsed() {
+                            let txt = format!(
+                                "rec {:.0} с · {frames} кадров · пропусков {dropped}",
+                                t.as_secs_f32()
+                            );
+                            ui.label(egui::RichText::new(txt).color(egui::Color32::from_rgb(230, 90, 90)));
+                        }
+                    }
+                    RecorderState::Saving { path } => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "сохранение {} …",
+                                path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    RecorderState::Done { path, frames } => {
+                        ui.label(
+                            egui::RichText::new(format!("✓ {frames} кадров → {}", path.display()))
+                                .color(egui::Color32::from_rgb(140, 220, 140)),
+                        );
+                    }
+                    RecorderState::Failed(e) => {
+                        ui.label(egui::RichText::new(format!("ошибка: {e}")).color(egui::Color32::from_rgb(230, 110, 110)));
+                    }
+                    RecorderState::Idle => {}
                 }
                 let mut vc = self.vcam.active;
                 if ui.checkbox(&mut vc, "вирт-камера (stub)").changed() {
@@ -278,12 +356,6 @@ impl Studio {
                     } else {
                         self.vcam.stop();
                     }
-                }
-                if let Some(t) = self.recorder.started_at {
-                    ui.label(
-                        egui::RichText::new(format!("rec: {:.0} с", t.elapsed().as_secs_f32()))
-                            .color(egui::Color32::from_rgb(220, 90, 90)),
-                    );
                 }
             });
             ui.add_space(6.0);
@@ -344,6 +416,47 @@ impl Studio {
         gfx.compositor.update_sources(&gfx.device, &gfx.queue, &self.screen_slot, &self.cam_slot);
         self.scene.advance();
         gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
+
+        // Sink taps: CPU readback for the recorder, paced to the declared fps.
+        if let Some(secs) = self.auto_record {
+            if !self.recorder.is_active() && self.dbg_tick >= 1 && self.recorder.state().idle_like() && !self.auto_record_done {
+                self.auto_record_done = true;
+                self.recorder.start(
+                    recorder::default_output_path(),
+                    AudioSource::Default,
+                    (SCENE_W, SCENE_H),
+                    30,
+                );
+                tracing::info!(path = %self.recorder.state().path_label().unwrap_or_default(), "auto-record started");
+            }
+            if self.recorder.is_active() {
+                if let Some(t) = self.recorder.elapsed() {
+                    if t.as_secs() >= secs {
+                        self.recorder.stop();
+                        tracing::info!("auto-record stopped after {}s", t.as_secs());
+                    }
+                }
+            }
+        }
+        if self.recorder.want_frame() {
+            let grabbed = match self.recorder.sender() {
+                Some((tx, dropped)) => gfx.compositor.grab(move |bytes| {
+                    tracing::debug!(len = bytes.len(), "readback delivered");
+                    Recorder::feed(&tx, &dropped, bytes);
+                }),
+                None => false,
+            };
+            if self.dbg_tick % 60 == 0 {
+                tracing::debug!(grabbed, "recorder grab tick");
+            }
+        }
+        // Wake readback completions so frames reach ffmpeg promptly.
+        if gfx.compositor.grabs_in_flight > 0 {
+            if gfx.device.poll(wgpu::PollType::Poll).is_ok() {
+                gfx.compositor.poll_slots();
+            }
+        }
+
         let preview = gfx.compositor.preview_handles();
 
         // Size polling: on some Wayland compositors `WindowEvent::Resized`
@@ -354,8 +467,8 @@ impl Studio {
         self.sync_surface_size(&mut painter, inner);
         let inner_px = (inner.width, inner.height);
 
+        self.dbg_tick += 1;
         if self.debug {
-            self.dbg_tick += 1;
             // Toggle the window size every 30 frames to exercise the resize path.
             if self.dbg_tick % 30 == 0 {
                 let (w, h) = if (self.dbg_tick / 30) % 2 == 0 { (1400, 900) } else { (900, 560) };

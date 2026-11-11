@@ -66,7 +66,7 @@ ffmpeg subprocess (в плане) · v4l2loopback (вирт-камера) · Pip
       режимов с watchdog) — ждёт подтверждения на железе (BRIO);
       `scripts/camera-loopback-test.sh` проверяет путь без вебкамеры
 - [ ] Захват экрана: portal ScreenCast + PipeWire
-- [ ] Запись: ffmpeg-subprocess (видео + микрофон)
+- [x] Запись: ffmpeg-pipe (видео + микрофон через Pulse) — проверено end-to-end
 - [ ] Вирт-камера: запись YUYV/I420 в /dev/videoN
 - [ ] Аудио: микрофон + системный микс, микшер
 - [ ] Шаблоны сцен/титров: JSON-layout'ы, lower-thirds, эмодзи-бар

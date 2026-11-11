@@ -11,9 +11,16 @@ use crate::scene::Scene;
 use bytemuck::{Pod, Zeroable};
 use frame_tex::FrameTexture;
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const SCENE_W: u32 = 1280;
 pub const SCENE_H: u32 = 720;
+/// Staging buffer size for CPU readback: rows padded to wgpu's 256-byte
+/// alignment (1280*4 = 5120 already satisfies it).
+const READBACK_ROW_PAD: u32 = 256;
+const READBACK_BYTES: u64 =
+    (SCENE_W * 4).next_multiple_of(READBACK_ROW_PAD) as u64 * SCENE_H as u64;
 
 /// Uniform-buffer struct, mirrors `struct Params` in scene.wgsl.
 #[repr(C)]
@@ -36,6 +43,8 @@ pub struct GpuScene {
 }
 
 pub struct Compositor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     // keeps the RT alive until shutdown; consumers go through the preview path
     #[allow(dead_code)]
     rt: wgpu::Texture,
@@ -50,6 +59,17 @@ pub struct Compositor {
     cam: FrameTexture,
     pub screen_seq: u64,
     pub cam_seq: u64,
+    /// Ring of staging buffers for CPU readback (see `grab`).
+    slots: Vec<ReadSlot>,
+    next_slot: usize,
+    pub grabs_in_flight: u64,
+}
+
+struct ReadSlot {
+    buf: wgpu::Buffer,
+    /// Set by the map callback on completion; `poll_slots` frees the slot.
+    done: Arc<AtomicBool>,
+    busy: bool,
 }
 
 impl Compositor {
@@ -58,7 +78,9 @@ impl Compositor {
             device,
             SCENE_W,
             SCENE_H,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             "scene-rt",
         );
         let rt_view = rt.create_view(&wgpu::TextureViewDescriptor::default());
@@ -191,6 +213,8 @@ impl Compositor {
         });
 
         Self {
+            device: device.clone(),
+            queue: queue.clone(),
             rt,
             rt_view,
             preview_bind,
@@ -203,6 +227,20 @@ impl Compositor {
             cam: FrameTexture::black(device, queue, "cam-placeholder"),
             screen_seq: 0,
             cam_seq: 0,
+            slots: (0..3)
+                .map(|i| ReadSlot {
+                    buf: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&format!("readback-{i}")),
+                        size: READBACK_BYTES,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    done: Arc::new(AtomicBool::new(false)),
+                    busy: false,
+                })
+                .collect(),
+            next_slot: 0,
+            grabs_in_flight: 0,
         }
     }
 
@@ -300,6 +338,87 @@ impl Compositor {
 
     /// Preview handles: the pipeline sampling the render target. wgpu handles are
     /// cheap Arc clones, taken into a fresh PaintCallback each frame.
+    /// Copy the current scene RT into a free staging buffer and map it
+    /// asynchronously; `on_done` fires on a later `device.poll()` with the
+    /// frame bytes. Returns false when all slots are busy (caller skips this
+    /// tick; with a 3-slot ring at 30 fps this cannot stall a sink).
+    pub fn grab(&mut self, on_done: impl FnOnce(Vec<u8>) + Send + 'static) -> bool {
+        let n = self.slots.len();
+        let start = self.next_slot;
+        let mut chosen = None;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if !self.slots[idx].busy {
+                chosen = Some(idx);
+                break;
+            }
+        }
+        let Some(idx) = chosen else { return false };
+        self.slots[idx].busy = true;
+        self.slots[idx].done.store(false, Ordering::Relaxed);
+        self.next_slot = (idx + 1) % n;
+
+        let (buf, done) = (self.slots[idx].buf.clone(), self.slots[idx].done.clone());
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("readback") },
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.rt,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SCENE_W * 4),
+                    rows_per_image: Some(SCENE_H),
+                },
+            },
+            wgpu::Extent3d {
+                width: SCENE_W,
+                height: SCENE_H,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let (buf_cb, done_cb) = (buf.clone(), done.clone());
+        buf.map_async(wgpu::MapMode::Read, .., move |result| {
+            if result.is_err() {
+                tracing::error!("readback map failed");
+                done_cb.store(true, Ordering::Relaxed);
+                return;
+            }
+            let bytes = match buf_cb.get_mapped_range(..) {
+                Ok(view) => view.to_vec(),
+                Err(e) => {
+                    tracing::error!("readback map range: {e:?}");
+                    Vec::new()
+                }
+            };
+            buf_cb.unmap();
+            if !bytes.is_empty() {
+                on_done(bytes);
+            }
+            done_cb.store(true, Ordering::Relaxed);
+        });
+        self.grabs_in_flight += 1;
+        true
+    }
+
+    /// Free slots whose map callback completed; call after `device.poll()`.
+    pub fn poll_slots(&mut self) {
+        for slot in &mut self.slots {
+            if slot.busy && slot.done.load(Ordering::Relaxed) {
+                slot.busy = false;
+                self.grabs_in_flight -= 1;
+            }
+        }
+    }
+
     pub fn preview_handles(&self) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
         (self.preview_pipe.clone(), self.preview_bind.clone())
     }
