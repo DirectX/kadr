@@ -1,8 +1,8 @@
-// Broadcast frame composition: background (screen) + camera circle with a ring.
-// UV: (0,0) is the top-left corner of the canvas.
+// Broadcast frame composition: background (screen) + camera (circle or
+// fullscreen cover). UV: (0,0) is the top-left corner of the canvas.
 
 struct Params {
-    bg_vis: f32,
+    bg_alpha: f32,   // background opacity (crossfade)
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -11,10 +11,10 @@ struct Params {
     cam_radius: f32, // fraction of canvas height
     cam_border: f32,
     aspect: f32,     // canvas width / height
-    cam_aspect: f32, // camera source width / height (for cover crop)
+    cam_aspect: f32, // camera source width / height
+    cam_full: f32,   // 0..1 crossfade into fullscreen camera cover
     _pad3: f32,
     _pad4: f32,
-    _pad5: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -37,35 +37,52 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     return out;
 }
 
+// Cover-crop fractions: sampling a region of aspect `dst` out of a source of
+// aspect `src`. The source is wider than the region (src > dst) -> crop x;
+// otherwise crop y. (For 16:9 canvas over 4:3 source: r = 1.78/1.33 > 1,
+// the source is relatively taller -> crop y.)
+fn cover_crop(dst: f32, src: f32) -> vec2<f32> {
+    let r = dst / max(src, 1e-4);
+    if (r >= 1.0) {
+        return vec2<f32>(1.0, 1.0 / r);
+    }
+    return vec2<f32>(r, 1.0);
+}
+
 @fragment
 fn fs_main(input: VOut) -> @location(0) vec4<f32> {
     var color = vec4<f32>(0.05, 0.055, 0.07, 1.0);
-    if (p.bg_vis > 0.5) {
-        color = textureSampleLevel(bg_tex, smp, input.uv, 0.0);
+    if (p.bg_alpha > 0.001) {
+        let bg = textureSampleLevel(bg_tex, smp, input.uv, 0.0);
+        color = mix(color, bg, p.bg_alpha);
     }
     if (p.cam_vis > 0.5) {
-        let center = p.cam_rect.xy + p.cam_rect.zw * 0.5;
-        let d = input.uv - center;
-        let r = p.cam_radius;
-        let dist = length(vec2<f32>(d.x * p.aspect, d.y));
-        let aa = max(fwidth(dist), 1e-4);
-        let inside = 1.0 - smoothstep(r - aa, r + aa, dist);
-        let ring_out = r + p.cam_border;
-        let ring = smoothstep(r - aa, r + aa, dist)
-                 * (1.0 - smoothstep(ring_out - aa, ring_out + aa, dist));
-
-        // Cover-crop: the circle is square in screen space, so sample the
-        // centered largest square of the source instead of stretching it.
-        var crop = vec2<f32>(1.0);
-        if (p.cam_aspect > 1.0) {
-            crop.x = 1.0 / p.cam_aspect;
-        } else if (p.cam_aspect > 0.0) {
-            crop.y = p.cam_aspect;
+        // Fullscreen cover (the "speaker full" preset, crossfaded in).
+        if (p.cam_full > 0.001) {
+            let crop = cover_crop(p.aspect, p.cam_aspect);
+            let uv = vec2<f32>(0.5) + (input.uv - vec2<f32>(0.5)) * crop;
+            let cam = textureSampleLevel(cam_tex, smp, clamp(uv, vec2(0.002), vec2(0.998)), 0.0);
+            color = mix(color, cam, p.cam_full);
         }
-        let cam_uv = vec2<f32>(0.5) + d / (p.cam_rect.zw * 0.5) * (crop * 0.5);
-        let cam = textureSampleLevel(cam_tex, smp, clamp(cam_uv, vec2(0.002), vec2(0.998)), 0.0);
-        color = mix(color, cam, inside);
-        color = mix(color, vec4<f32>(1.0, 1.0, 1.0, 1.0), ring * 0.9);
+        // Circle overlay, faded out as the fullscreen cover takes over.
+        let circle_w = 1.0 - p.cam_full;
+        if (circle_w > 0.001) {
+            let center = p.cam_rect.xy + p.cam_rect.zw * 0.5;
+            let d = input.uv - center;
+            let r = p.cam_radius;
+            let dist = length(vec2<f32>(d.x * p.aspect, d.y));
+            let aa = max(fwidth(dist), 1e-4);
+            let inside = (1.0 - smoothstep(r - aa, r + aa, dist)) * circle_w;
+            let ring_out = r + p.cam_border;
+            let ring = smoothstep(r - aa, r + aa, dist)
+                     * (1.0 - smoothstep(ring_out - aa, ring_out + aa, dist))
+                     * circle_w;
+            let crop = cover_crop(1.0, p.cam_aspect);
+            let cam_uv = vec2<f32>(0.5) + d / (p.cam_rect.zw * 0.5) * (crop * 0.5);
+            let cam = textureSampleLevel(cam_tex, smp, clamp(cam_uv, vec2(0.002), vec2(0.998)), 0.0);
+            color = mix(color, cam, inside);
+            color = mix(color, vec4<f32>(1.0, 1.0, 1.0, 1.0), ring * 0.9);
+        }
     }
     return vec4<f32>(color.rgb, 1.0);
 }

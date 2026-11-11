@@ -22,26 +22,40 @@ pub struct Layout {
     pub name: &'static str,
     pub bg_on: bool,
     pub cam_on: bool,
+    /// Camera covers the whole canvas (crossfaded, ring hidden).
+    pub cam_full: bool,
     pub cam: CamPose,
 }
 
-pub const PRESETS: [Layout; 3] = [
+pub const PRESETS: [Layout; 4] = [
     Layout {
         name: "loom",
         bg_on: true,
         cam_on: true,
+        cam_full: false,
         cam: CamPose { x: 0.83, y: 0.79, radius: 0.14, border: 0.014 },
     },
     Layout {
         name: "спикер",
         bg_on: true,
         cam_on: true,
+        cam_full: false,
         cam: CamPose { x: 0.73, y: 0.50, radius: 0.40, border: 0.008 },
+    },
+    Layout {
+        name: "спикер полный",
+        bg_on: false,
+        cam_on: true,
+        cam_full: true,
+        // Radius only matters for the transition shape; the fullscreen
+        // blend dominates the final frame.
+        cam: CamPose { x: 0.5, y: 0.5, radius: 0.5, border: 0.0 },
     },
     Layout {
         name: "только экран",
         bg_on: true,
         cam_on: false,
+        cam_full: false,
         cam: CamPose { x: 0.83, y: 0.79, radius: 0.0, border: 0.0 },
     },
 ];
@@ -68,6 +82,14 @@ pub struct Scene {
     pub current: CamPose,
     start: Instant,
     dur: f32,
+    /// Crossfade blends: background opacity and camera-full coverage, both
+    /// interpolated during a transition so presets dissolve into each other.
+    from_bg_alpha: f32,
+    target_bg_alpha: f32,
+    pub bg_alpha: f32,
+    from_cam_full: f32,
+    target_cam_full: f32,
+    pub cam_full: f32,
 }
 
 impl Scene {
@@ -81,6 +103,12 @@ impl Scene {
             current: p.cam,
             start: Instant::now(),
             dur: 0.0,
+            from_bg_alpha: 1.0,
+            target_bg_alpha: 1.0,
+            bg_alpha: 1.0,
+            from_cam_full: 0.0,
+            target_cam_full: 0.0,
+            cam_full: 0.0,
         }
     }
 
@@ -89,6 +117,10 @@ impl Scene {
         self.target = l.cam;
         self.bg_on = l.bg_on;
         self.cam_on = l.cam_on;
+        self.from_bg_alpha = self.bg_alpha;
+        self.target_bg_alpha = if l.bg_on { 1.0 } else { 0.0 };
+        self.from_cam_full = self.cam_full;
+        self.target_cam_full = l.cam_full as u8 as f32;
         self.start = Instant::now();
         self.dur = dur;
     }
@@ -107,6 +139,8 @@ impl Scene {
             radius: lerp(self.from.radius, self.target.radius, eb),
             border: lerp(self.from.border, self.target.border, e),
         };
+        self.bg_alpha = lerp(self.from_bg_alpha, self.target_bg_alpha, e);
+        self.cam_full = lerp(self.from_cam_full, self.target_cam_full, e);
         if t >= 1.0 {
             self.dur = 0.0;
         }

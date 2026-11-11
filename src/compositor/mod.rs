@@ -26,7 +26,8 @@ const READBACK_BYTES: u64 =
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuScene {
-    pub bg_vis: f32,
+    /// Background opacity (crossfades to 0 in speaker-fullscreen presets).
+    pub bg_alpha: f32,
     pub _pad0: f32,
     pub _pad1: f32,
     pub _pad2: f32,
@@ -37,9 +38,10 @@ pub struct GpuScene {
     pub aspect: f32,
     /// Source frame aspect (w/h) of the camera texture, for cover-cropping.
     pub cam_aspect: f32,
+    /// Camera fullscreen coverage blend, 0..1 (crossfade into "speaker full").
+    pub cam_full: f32,
     pub _pad3: f32,
     pub _pad4: f32,
-    pub _pad5: f32,
 }
 
 pub struct Compositor {
@@ -278,7 +280,7 @@ impl Compositor {
         let aspect = SCENE_W as f32 / SCENE_H as f32;
         let (cw, ch) = self.cam.size();
         let params = GpuScene {
-            bg_vis: scene.bg_on as u8 as f32,
+            bg_alpha: if scene.bg_on { scene.bg_alpha } else { 0.0 },
             _pad0: 0.0,
             _pad1: 0.0,
             _pad2: 0.0,
@@ -288,9 +290,9 @@ impl Compositor {
             cam_border: scene.current.border,
             aspect,
             cam_aspect: cw as f32 / ch.max(1) as f32,
+            cam_full: scene.cam_full,
             _pad3: 0.0,
             _pad4: 0.0,
-            _pad5: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
 

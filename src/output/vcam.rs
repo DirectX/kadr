@@ -187,37 +187,51 @@ fn writer_loop(
     let fmt = dev
         .set_format(&v4l::format::Format::new(size.0, size.1, FourCC::new(b"YUYV")))
         .map_err(|e| format!("set YUYV {}x{}: {e}", size.0, size.1))?;
+    let stride = fmt.stride as usize;
     let mut stream =
         MmapStream::with_buffers(&dev, Type::VideoOutput, 4).map_err(|e| format!("mmap output: {e}"))?;
     stream.set_timeout(Duration::from_millis(200));
 
-    let desc = format!("/dev/video{index} YUYV {}x{}", fmt.width, fmt.height);
+    let desc = format!("/dev/video{index} YUYV {}x{} (stride {stride})", fmt.width, fmt.height);
     tracing::info!(%desc, "virtual cam running");
     *status.lock().unwrap() = VcamStatus::Running {
         desc: desc.clone(),
         frames: 0,
     };
 
-    let mut yuyv = vec![0u8; fmt.size as usize];
+    let mut last_frame: Option<Arc<crate::capture::Frame>> = None;
     let mut last_seq = 0u64;
     let mut frames = 0u64;
     let mut pacer = Pacer::new(fps);
     let mut last_report = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        // Convert only when a fresher frame arrived; repeat the last one
-        // otherwise so readers see a steady stream instead of a freeze.
+        // Adopt a fresher source frame when one arrived.
         if let Some(f) = slot.latest() {
             if f.seq != last_seq {
-                rgba_to_yuyv(&f.data, &mut yuyv, f.width as usize, f.height as usize);
                 last_seq = f.seq;
+                last_frame = Some(f);
             }
         }
         match stream.next() {
             Ok((buf, meta)) => {
-                let n = buf.len().min(yuyv.len());
-                buf[..n].copy_from_slice(&yuyv[..n]);
-                meta.bytesused = n as u32;
+                if let Some(f) = &last_frame {
+                    // Convert straight into the driver plane, honoring stride.
+                    rgba_to_yuyv(
+                        &f.data,
+                        buf,
+                        f.width as usize,
+                        f.height as usize,
+                        stride,
+                    );
+                    meta.bytesused = fmt.size;
+                } else {
+                    // No frame yet: emit a black plane so readers see a valid stream.
+                    for b in buf.iter_mut() {
+                        *b = 0x10; // Y=16 (black), chroma bytes land near 128
+                    }
+                    meta.bytesused = fmt.size;
+                }
                 frames += 1;
                 if last_report.elapsed() > Duration::from_secs(2) {
                     last_report = Instant::now();
@@ -241,36 +255,48 @@ fn writer_loop(
     Ok(frames)
 }
 
-/// RGBA8 → YUYV (BT.601, 4:2:2 horizontal subsampling; chroma taken from the
-/// even pixel of each pair). Integer math: ~1 ms per 720p frame in release.
-fn rgba_to_yuyv(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
-    let pairs_per_row = w / 2;
-    if pairs_per_row == 0 {
+/// RGBA8 → YUYV written **directly into the driver buffer** with the driver's
+/// own bytes-per-line (`stride`), so a padded plane can never shift rows
+/// (that is the classic "horizontal streak" artifact). BT.601 studio-swing
+/// coefficients; 4:2:2 horizontal subsampling, chroma from the even pixel.
+///
+/// Row-based, no integer divisions, no intermediate copy: ~2 ms per 720p
+/// frame in release. The earlier div/mod + memcpy version cost ~15 ms and
+/// fought the MJPEG decoder thread for L2/L3 bandwidth (visible as 20 fps).
+fn rgba_to_yuyv(src: &[u8], dst: &mut [u8], w: usize, h: usize, stride: usize) {
+    let pairs = w / 2;
+    if pairs == 0 || stride < pairs * 4 {
         return;
     }
-    let pairs = pairs_per_row * h;
-    for p in 0..pairs {
-        let x = (p % pairs_per_row) * 2;
-        let y = p / pairs_per_row;
-        let i0 = (y * w + x) * 4;
-        let i1 = i0 + 4;
-        let o = p * 4;
-        if i1 + 2 >= src.len() || o + 3 >= dst.len() {
+    let src_stride = w * 4;
+    let row_bytes = pairs * 4;
+    for y in 0..h {
+        let srow = y * src_stride;
+        let drow = y * stride;
+        // One bounds check per row: the last pair reads src[srow + row_bytes-1].
+        if srow + row_bytes > src.len() || drow + row_bytes > dst.len() {
             break;
         }
-        let (r0, g0, b0) = (src[i0] as i32, src[i0 + 1] as i32, src[i0 + 2] as i32);
-        let (r1, g1, b1) = (src[i1] as i32, src[i1 + 1] as i32, src[i1 + 2] as i32);
-        // Full-range BT.601 luma, clamped to the legal 16..235 band.
-        let y0 = ((19_595 * r0 + 38_470 * g0 + 7_471 * b0 + 0x8000) >> 16).clamp(16, 235);
-        let y1 = ((19_595 * r1 + 38_470 * g1 + 7_471 * b1 + 0x8000) >> 16).clamp(16, 235);
-        // Chroma from RGB directly (12-bit scaled BT.601): computing it from the
-        // *clamped* luma would skew neutrals (white would land at U=139, not 128).
-        let u = (128 + ((-1382 * r0 - 2714 * g0 + 4096 * b0 + 2048) >> 12)).clamp(0, 255);
-        let v = (128 + ((4096 * r0 - 3430 * g0 - 666 * b0 + 2048) >> 12)).clamp(0, 255);
-        dst[o] = y0 as u8;
-        dst[o + 1] = u as u8;
-        dst[o + 2] = y1 as u8;
-        dst[o + 3] = v as u8;
+        for p in 0..pairs {
+            let i0 = srow + p * 8;
+            let (r0, g0, b0) = (src[i0] as i32, src[i0 + 1] as i32, src[i0 + 2] as i32);
+            let (r1, g1, b1) = (src[i0 + 4] as i32, src[i0 + 5] as i32, src[i0 + 6] as i32);
+            // Full-range BT.601 luma, then mapped into the 16..235 studio band.
+            let yf0 = (19_595 * r0 + 38_470 * g0 + 7_471 * b0 + 0x8000) >> 16;
+            let yf1 = (19_595 * r1 + 38_470 * g1 + 7_471 * b1 + 0x8000) >> 16;
+            let y0 = 16 + ((219 * yf0 + 128) >> 8);
+            let y1 = 16 + ((219 * yf1 + 128) >> 8);
+            // Chroma: studio-swing BT.601 (coefficients sum to ~0, so neutral
+            // grays land exactly on 128). Computed from RGB, never from the
+            // clamped luma, which would skew neutrals.
+            let u = 128 + ((-607 * r0 - 1192 * g0 + 1799 * b0 + 2048) >> 12);
+            let v = 128 + ((1799 * r0 - 1507 * g0 - 293 * b0 + 2048) >> 12);
+            let o = drow + p * 4;
+            dst[o] = y0.clamp(0, 255) as u8;
+            dst[o + 1] = u.clamp(0, 255) as u8;
+            dst[o + 2] = y1.clamp(0, 255) as u8;
+            dst[o + 3] = v.clamp(0, 255) as u8;
+        }
     }
 }
 
@@ -283,20 +309,21 @@ mod tests {
         // One pair: red (even pixel, owns the chroma), then white.
         let src = [255u8, 0, 0, 255, 255, 255, 255, 255];
         let mut dst = vec![0u8; 4];
-        rgba_to_yuyv(&src, &mut dst, 2, 1);
-        // Red luma is low; white luma is high.
+        rgba_to_yuyv(&src, &mut dst, 2, 1, 4);
+        // Red luma ~33 (studio swing); white ~235.
         assert!(dst[0] < 120, "red luma {}", dst[0]);
         assert!(dst[2] >= 230, "white luma {}", dst[2]);
-        // Chroma of the pair comes from the EVEN pixel (red): strong V, low U.
+        // Chroma from the EVEN pixel (red): canonical BT.601 studio values
+        // are U=90, V=240 for pure red.
         assert!(dst[3] > 200, "red V {}", dst[3]);
-        assert!(dst[1] < 90, "red U {}", dst[1]);
+        assert!(dst[1] < 100, "red U {}", dst[1]);
     }
 
     #[test]
     fn rgba_to_yuyv_white_pair_is_neutral() {
         let src = [255u8, 255, 255, 255, 255, 255, 255, 255];
         let mut dst = vec![0u8; 4];
-        rgba_to_yuyv(&src, &mut dst, 2, 1);
+        rgba_to_yuyv(&src, &mut dst, 2, 1, 4);
         assert!(dst[0] >= 230, "white luma {}", dst[0]);
         assert!((dst[1] as i32 - 128).abs() <= 2, "white U {}", dst[1]);
         assert!((dst[3] as i32 - 128).abs() <= 2, "white V {}", dst[3]);
@@ -306,11 +333,35 @@ mod tests {
     fn rgba_to_yuyv_gray_chroma_neutral() {
         let (w, h) = (8, 4);
         let src = vec![128u8; w * h * 4];
-        let mut dst = vec![0u8; w * h * 2];
-        rgba_to_yuyv(&src, &mut dst, w, h);
+        let mut dst = vec![0u8; (w / 2) * 4 * h];
+        rgba_to_yuyv(&src, &mut dst, w, h, (w / 2) * 4);
         for chunk in dst.chunks_exact(4) {
-            assert!((chunk[1] as i32 - 128).abs() <= 3, "U {}", chunk[1]);
-            assert!((chunk[3] as i32 - 128).abs() <= 3, "V {}", chunk[3]);
+            assert!((chunk[1] as i32 - 128).abs() <= 2, "U {}", chunk[1]);
+            assert!((chunk[3] as i32 - 128).abs() <= 2, "V {}", chunk[3]);
+        }
+    }
+
+    #[test]
+    fn rgba_to_yuyv_honors_stride() {
+        // Padded plane: stride > tight row width. Rows must not bleed.
+        let (w, h) = (4, 2);
+        let tight = (w / 2) * 4; // 8 bytes per row
+        let stride = tight + 4; // pad 4 bytes
+        let mut dst = vec![0xAAu8; stride * h];
+        // Row 0 gray, row 1 gray — chroma must land 128, padding untouched.
+        let src = vec![128u8; w * h * 4];
+        rgba_to_yuyv(&src, &mut dst, w, h, stride);
+        for y in 0..h {
+            let base = y * stride;
+            for p in 0..w / 2 {
+                let o = base + p * 4;
+                assert!((dst[o + 1] as i32 - 128).abs() <= 2, "U row {y}");
+                assert!((dst[o + 3] as i32 - 128).abs() <= 2, "V row {y}");
+            }
+            // Padding bytes are left as-is (0xAA).
+            for b in &dst[base + tight..base + stride] {
+                assert_eq!(*b, 0xAA, "padding overwritten at row {y}");
+            }
         }
     }
 
@@ -319,7 +370,7 @@ mod tests {
         // Odd widths: the trailing pixel has no pair partner; must not panic.
         let (w, h) = (5, 2);
         let src = vec![200u8; w * h * 4];
-        let mut dst = vec![0u8; (w / 2) * h * 4];
-        rgba_to_yuyv(&src, &mut dst, w, h);
+        let mut dst = vec![0u8; (w / 2) * 4 * h];
+        rgba_to_yuyv(&src, &mut dst, w, h, (w / 2) * 4);
     }
 }

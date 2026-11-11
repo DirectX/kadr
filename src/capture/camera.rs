@@ -54,6 +54,8 @@ pub enum CaptureStatus {
 
 /// Enumerate V4L2 capture devices. Errors are non-fatal: an unreadable node is
 /// simply skipped (a sandbox or a missing permission must not break the UI).
+/// Nodes that expose none of our preferred formats (e.g. BRIO's GREY-only
+/// metadata node) are filtered out — they can never produce frames here.
 pub fn enumerate() -> Vec<CameraInfo> {
     let mut found = Vec::new();
     if let Ok(dir) = std::fs::read_dir("/dev") {
@@ -78,7 +80,7 @@ pub fn enumerate() -> Vec<CameraInfo> {
         if !caps.capabilities.contains(Flags::VIDEO_CAPTURE) {
             continue;
         }
-        let formats = dev
+        let formats: Vec<String> = dev
             .enum_formats()
             .map(|list| {
                 list.iter()
@@ -86,6 +88,10 @@ pub fn enumerate() -> Vec<CameraInfo> {
                     .collect()
             })
             .unwrap_or_default();
+        let prefs = preferred_fourccs();
+        if !formats.iter().any(|f| prefs.iter().any(|p| p.str().ok() == Some(f.as_str()))) {
+            continue; // no usable pixel format on this node
+        }
         out.push(CameraInfo {
             index,
             card: caps.card,
@@ -260,9 +266,33 @@ fn run(
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), String> {
+    // Opening can hit EBUSY right after a source switch: the previous thread
+    // still holds the fd until its poll times out (~200 ms). Retry briefly.
     let cands = {
-        let dev = Device::new(index as usize).map_err(|e| format!("open /dev/video{index}: {e}"))?;
-        candidates(&dev)?
+        let mut opened: Option<Vec<(FourCC, u32, u32)>> = None;
+        let mut busy_err = String::new();
+        for i in 0..8 {
+            match Device::new(index as usize) {
+                Ok(dev) => {
+                    opened = Some(candidates(&dev)?);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(16 /* EBUSY */) && i < 7 => {
+                    tracing::debug!(index, attempt = i + 1, "device busy, retrying");
+                    busy_err = e.to_string();
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Err(e) => return Err(format!("open /dev/video{index}: {e}")),
+            }
+        }
+        match opened {
+            Some(c) => c,
+            None => {
+                return Err(format!(
+                    "open /dev/video{index}: {busy_err} (held by the previous session)"
+                ))
+            }
+        }
     };
     let total = cands.len();
     let mut last_err = String::from("no attempt ran");
