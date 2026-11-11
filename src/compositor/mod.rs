@@ -40,7 +40,8 @@ pub struct GpuScene {
     pub cam_aspect: f32,
     /// Camera fullscreen coverage blend, 0..1 (crossfade into "speaker full").
     pub cam_full: f32,
-    pub _pad3: f32,
+    /// Circle layer weight, 0..1 (suppressed when growing from nothing).
+    pub circle_vis: f32,
     pub _pad4: f32,
 }
 
@@ -291,7 +292,7 @@ impl Compositor {
             aspect,
             cam_aspect: cw as f32 / ch.max(1) as f32,
             cam_full: scene.cam_full,
-            _pad3: 0.0,
+            circle_vis: scene.circle_vis(),
             _pad4: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));

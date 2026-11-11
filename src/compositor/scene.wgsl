@@ -13,7 +13,7 @@ struct Params {
     aspect: f32,     // canvas width / height
     cam_aspect: f32, // camera source width / height
     cam_full: f32,   // 0..1 crossfade into fullscreen camera cover
-    _pad3: f32,
+    circle_vis: f32, // 0..1 circle weight (suppressed when it would grow from nothing)
     _pad4: f32,
 };
 
@@ -64,8 +64,9 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
             let cam = textureSampleLevel(cam_tex, smp, clamp(uv, vec2(0.002), vec2(0.998)), 0.0);
             color = mix(color, cam, p.cam_full);
         }
-        // Circle overlay, faded out as the fullscreen cover takes over.
-        let circle_w = 1.0 - p.cam_full;
+        // Circle overlay, faded out as the fullscreen cover takes over;
+        // suppressed entirely when its growth would flicker against the blend.
+        let circle_w = (1.0 - p.cam_full) * p.circle_vis;
         if (circle_w > 0.001) {
             let center = p.cam_rect.xy + p.cam_rect.zw * 0.5;
             let d = input.uv - center;
