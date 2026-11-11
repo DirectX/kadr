@@ -13,6 +13,7 @@ use frame_tex::FrameTexture;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 pub const SCENE_W: u32 = 1280;
 pub const SCENE_H: u32 = 720;
@@ -21,6 +22,9 @@ pub const SCENE_H: u32 = 720;
 const READBACK_ROW_PAD: u32 = 256;
 const READBACK_BYTES: u64 =
     (SCENE_W * 4).next_multiple_of(READBACK_ROW_PAD) as u64 * SCENE_H as u64;
+
+/// Dissolve duration for camera cuts (a soft "наплыв" instead of a hard cut).
+pub const DISSOLVE_SECS: f32 = 0.45;
 
 /// Uniform-buffer struct, mirrors `struct Params` in scene.wgsl.
 #[repr(C)]
@@ -45,7 +49,8 @@ pub struct GpuScene {
     /// Face-tracking pan: cover-crop window shift in source-UV units.
     pub cam_dx: f32,
     pub cam_dy: f32,
-    pub _pad5: f32,
+    /// Dissolve weight of the ghost (previous-plan) frame, 1 -> 0 over ~0.45 s.
+    pub ghost_alpha: f32,
     pub _pad6: f32,
     pub _pad7: f32,
 }
@@ -71,6 +76,11 @@ pub struct Compositor {
     cam: FrameTexture,
     pub screen_seq: u64,
     pub cam_seq: u64,
+    /// Snapshot of the previous frame, dissolved over during camera cuts.
+    ghost: wgpu::Texture,
+    ghost_view: wgpu::TextureView,
+    ghost_since: Option<Instant>,
+    ghost_pending: bool,
     /// Ring of staging buffers for CPU readback (see `grab`).
     slots: Vec<ReadSlot>,
     next_slot: usize,
@@ -141,6 +151,7 @@ impl Compositor {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                tex_entry(4),
             ],
         });
         let preview_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -224,6 +235,15 @@ impl Compositor {
             ],
         });
 
+        let ghost = frame_tex::rgba_texture(
+            device,
+            SCENE_W,
+            SCENE_H,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            "ghost",
+        );
+        let ghost_view = ghost.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -239,6 +259,10 @@ impl Compositor {
             cam: FrameTexture::black(device, queue, "cam-placeholder"),
             screen_seq: 0,
             cam_seq: 0,
+            ghost,
+            ghost_view,
+            ghost_since: None,
+            ghost_pending: false,
             slots: (0..3)
                 .map(|i| ReadSlot {
                     buf: device.create_buffer(&wgpu::BufferDescriptor {
@@ -284,9 +308,59 @@ impl Compositor {
         Self::upload(device, queue, cam, cam_tex, cam_seq);
     }
 
-    /// Composes the scene frame into the offscreen render target. The single
-    /// producer of the final frame: all consumers (preview, file, virtual cam) read it.
-    pub fn render_scene(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
+    /// Request a cross-dissolve: before the next scene render, the current
+    /// RT (still holding the OLD camera's frame) is snapshotted into the
+    /// ghost texture and dissolves out over DISSOLVE_SECS. Called on camera
+    /// cuts — layout changes already have their own tweens.
+    pub fn mark_dissolve(&mut self) {
+        self.ghost_pending = true;
+    }
+
+    /// Compose the scene frame into the offscreen render target. The single
+    /// producer of the final frame: all consumers (preview, file, virtual
+    /// cam) read it.
+    pub fn render_scene(&mut self, scene: &Scene) {
+        let device = &self.device;
+        let queue = &self.queue;
+
+        // Snapshot the outgoing frame first: the copy must happen before the
+        // new camera's frame overwrites the RT.
+        if self.ghost_pending {
+            let mut enc = device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("ghost-snapshot") },
+            );
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.rt,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.ghost,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: SCENE_W, height: SCENE_H, depth_or_array_layers: 1 },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            self.ghost_pending = false;
+            self.ghost_since = Some(Instant::now());
+        }
+        let ghost_alpha = match self.ghost_since {
+            Some(t) => {
+                let e = t.elapsed().as_secs_f32() / DISSOLVE_SECS;
+                if e >= 1.0 {
+                    self.ghost_since = None;
+                    0.0
+                } else {
+                    1.0 - e
+                }
+            }
+            None => 0.0,
+        };
+
         let aspect = SCENE_W as f32 / SCENE_H as f32;
         let (cw, ch) = self.cam.size();
         let params = GpuScene {
@@ -304,7 +378,7 @@ impl Compositor {
             circle_vis: scene.circle_vis(),
             cam_dx: scene.track_offset[0],
             cam_dy: scene.track_offset[1],
-            _pad5: 0.0,
+            ghost_alpha,
             _pad6: 0.0,
             _pad7: 0.0,
         };
@@ -319,6 +393,7 @@ impl Compositor {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(self.screen.view()) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(self.cam.view()) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.ghost_view) },
             ],
         });
 

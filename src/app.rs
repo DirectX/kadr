@@ -127,13 +127,16 @@ pub struct Studio {
 
     screen: TestPatternSource,
     screen_slot: Arc<FrameSlot>,
-    cam_active: ActiveSrc,
+    cam_active: Option<ActiveSrc>,
     cam_slot: Arc<FrameSlot>,
     cam_devices: Vec<CameraInfo>,
     /// 0 = test pattern, otherwise index into `cam_devices` + 1.
     cam_choice: usize,
     /// Parked cameras (warm standby pool).
     warm: Vec<WarmCam>,
+    /// Set by set_camera on a real camera cut; draw_frame turns it into a
+    /// compositor dissolve (gfx is only reachable inside the render loop).
+    cut_dissolve: bool,
 
     scene: scene::Scene,
     active_preset: usize,
@@ -178,14 +181,14 @@ impl Studio {
     pub fn new() -> Self {
         let screen = TestPatternSource::start("screen", PatternKind::Screen, SCENE_W, SCENE_H, 30);
         let cam_devices = camera::enumerate();
-        let cam_active = ActiveSrc::Pattern(TestPatternSource::start(
+        let cam_active = Some(ActiveSrc::Pattern(TestPatternSource::start(
             "camera",
             PatternKind::Webcam,
             640,
             480,
             30,
-        ));
-        let cam_slot = cam_active.slot();
+        )));
+        let cam_slot = cam_active.as_ref().unwrap().slot();
         let screen_slot = screen.slot();
         Self {
             window: None,
@@ -199,6 +202,7 @@ impl Studio {
             cam_devices,
             cam_choice: 0,
             warm: Vec::new(),
+            cut_dissolve: false,
             scene: scene::Scene::new(),
             active_preset: 0,
             tracking: false,
@@ -237,11 +241,12 @@ impl Studio {
         if choice == self.cam_choice {
             // Same source: hotkey mashing must not disturb a live stream.
             let alive = match &self.cam_active {
-                ActiveSrc::Camera { status, .. } => matches!(
+                Some(ActiveSrc::Camera { status, .. }) => matches!(
                     *status.lock().unwrap(),
                     CaptureStatus::Running { .. } | CaptureStatus::Starting(_)
                 ),
-                ActiveSrc::Pattern(_) => true,
+                Some(ActiveSrc::Pattern(_)) => true,
+                None => false,
             };
             if alive || choice == 0 {
                 return;
@@ -250,30 +255,18 @@ impl Studio {
         self.cam_choice = choice;
         let now = Instant::now();
 
-        // 1. Demote the current camera into the pool (or drop the pattern).
-        let demoted = match std::mem::replace(
-            &mut self.cam_active,
-            ActiveSrc::Pattern(TestPatternSource::start(
-                "camera",
-                PatternKind::Webcam,
-                640,
-                480,
-                30,
-            )),
-        ) {
-            ActiveSrc::Camera { device, src, status } => {
-                src.set_rate(camera::RATE_STANDBY);
-                Some(WarmCam { device, src, status, last_used: now })
-            }
-            ActiveSrc::Pattern(_) => None,
-        };
-        if let Some(w) = demoted {
-            // Evict the least recently used warm camera if the pool is full.
-            if self.warm.iter().any(|c| c.device == w.device) {
-                // already parked (shouldn't happen; keep pool sane anyway)
-            } else {
+        // 1. Demote the current camera into the pool (a parked pattern thread
+        //    is simply dropped). No placeholder is spawned in between: the
+        //    previous version did, and every switch leaked a spawn+stop pair
+        //    of test-pattern threads into the log.
+        if let Some(ActiveSrc::Camera { device, src, status }) = self.cam_active.take() {
+            src.set_rate(camera::RATE_STANDBY);
+            if !self.warm.iter().any(|c| c.device == device) {
                 if self.warm.len() >= MAX_WARM {
-                    if let Some(victim) = self.warm.iter().enumerate()
+                    if let Some(victim) = self
+                        .warm
+                        .iter()
+                        .enumerate()
                         .min_by_key(|(_, c)| c.last_used)
                         .map(|(i, _)| i)
                     {
@@ -282,37 +275,53 @@ impl Studio {
                         drop(dead); // stop flag -> claim released ~50 ms later
                     }
                 }
-                self.warm.push(w);
+                self.warm.push(WarmCam { device, src, status, last_used: now });
             }
         }
 
-        // 2. Promote the requested camera, from warm pool or cold start.
-        if choice == 0 {
-            self.cam_active = ActiveSrc::Pattern(TestPatternSource::start(
+        // 2. Promote the requested camera: from the warm pool (atomic flip)
+        //    or cold. The test pattern is the fallback when the device list
+        //    went stale under us, so cam_active is always Some afterwards.
+        self.cam_active = if choice == 0 {
+            Some(ActiveSrc::Pattern(TestPatternSource::start(
                 "camera",
                 PatternKind::Webcam,
                 640,
                 480,
                 30,
-            ));
-        } else if let Some(dev) = self.cam_devices.get(choice - 1).map(|d| d.index) {
-            if let Some(pos) = self.warm.iter().position(|c| c.device == dev) {
-                let mut warm = self.warm.remove(pos);
-                warm.src.set_rate(camera::RATE_ACTIVE);
-                warm.last_used = now;
-                tracing::info!(device = dev, "camera promoted from warm standby");
-                self.cam_active = ActiveSrc::Camera {
-                    device: warm.device,
-                    src: warm.src,
-                    status: warm.status,
-                };
-            } else {
-                let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
-                let src = CameraSource::start(dev, status.clone(), camera::RATE_ACTIVE);
-                self.cam_active = ActiveSrc::Camera { device: dev, src, status };
+            )))
+        } else {
+            match self.cam_devices.get(choice - 1).map(|d| d.index) {
+                Some(dev) => match self.warm.iter().position(|c| c.device == dev) {
+                    Some(pos) => {
+                        let mut warm = self.warm.remove(pos);
+                        warm.src.set_rate(camera::RATE_ACTIVE);
+                        warm.last_used = now;
+                        tracing::info!(device = dev, "camera promoted from warm standby");
+                        Some(ActiveSrc::Camera {
+                            device: warm.device,
+                            src: warm.src,
+                            status: warm.status,
+                        })
+                    }
+                    None => {
+                        let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
+                        let src = CameraSource::start(dev, status.clone(), camera::RATE_ACTIVE);
+                        Some(ActiveSrc::Camera { device: dev, src, status })
+                    }
+                },
+                None => Some(ActiveSrc::Pattern(TestPatternSource::start(
+                    "camera",
+                    PatternKind::Webcam,
+                    640,
+                    480,
+                    30,
+                ))),
             }
-        }
-        self.cam_slot = self.cam_active.slot();
+        };
+        self.cam_slot = self.cam_active.as_ref().expect("set_camera always yields a source").slot();
+        // Any real switch gets a soft dissolve (settle below in draw_frame).
+        self.cut_dissolve = true;
         // Retarget the tracker; it resets its smoothing for the new viewpoint.
         if self.tracking {
             self.tracker.attach(self.cam_slot.clone());
@@ -445,8 +454,8 @@ impl Studio {
                             // Suffix: which slot this camera occupies in the rig.
                             let dev = self.cam_devices.get(idx - 1).map(|d| d.index);
                             let is_active = matches!(
-                                (&self.cam_active, dev),
-                                (ActiveSrc::Camera { device, .. }, Some(d)) if *device == d
+                                (self.cam_active.as_ref(), dev),
+                                (Some(ActiveSrc::Camera { device, .. }), Some(d)) if *device == d
                             );
                             let is_warm = dev.is_some_and(|d| self.warm.iter().any(|c| c.device == d));
                             let suffix = if is_active {
@@ -473,9 +482,9 @@ impl Studio {
                 if ui.small_button("↻ найти заново").clicked() {
                     self.rescan_cameras();
                 }
-                let status = match &self.cam_active {
-                    ActiveSrc::Camera { status, .. } => Some(status.lock().unwrap().clone()),
-                    ActiveSrc::Pattern(_) => None,
+                let status = match self.cam_active.as_ref() {
+                    Some(ActiveSrc::Camera { status, .. }) => Some(status.lock().unwrap().clone()),
+                    Some(ActiveSrc::Pattern(_)) | None => None,
                 };
                 let (txt, color) = match status.as_ref() {
                     Some(CaptureStatus::Starting(msg)) => (
@@ -789,8 +798,12 @@ impl Studio {
         if self.tracking {
             self.scene.track_offset = self.tracker.state().offset;
         }
+        if self.cut_dissolve {
+            gfx.compositor.mark_dissolve();
+            self.cut_dissolve = false;
+        }
         self.director_tick();
-        gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
+        gfx.compositor.render_scene(&self.scene);
 
         // Sink taps: one paced grab fans out to every active CPU consumer.
         if let Some(secs) = self.auto_record {

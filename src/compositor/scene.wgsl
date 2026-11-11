@@ -16,7 +16,7 @@ struct Params {
     circle_vis: f32, // 0..1 circle weight (suppressed when it would grow from nothing)
     cam_dx: f32,     // face-tracking pan: cover-crop window shift, source UV
     cam_dy: f32,
-    _pad5: f32,
+    ghost_alpha: f32, // dissolve weight of the previous frame, 1 -> 0
     _pad6: f32,
     _pad7: f32,
 };
@@ -25,6 +25,7 @@ struct Params {
 @group(0) @binding(1) var bg_tex: texture_2d<f32>;
 @group(0) @binding(2) var cam_tex: texture_2d<f32>;
 @group(0) @binding(3) var smp: sampler;
+@group(0) @binding(4) var ghost_tex: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -92,6 +93,13 @@ fn fs_main(input: VOut) -> @location(0) vec4<f32> {
             color = mix(color, cam, inside);
             color = mix(color, vec4<f32>(1.0, 1.0, 1.0, 1.0), ring * 0.9);
         }
+    }
+    // Dissolve: fade the previous frame (snapshot taken before the camera
+    // cut) out over the new composition. Covers every layer uniformly, so
+    // a camera swap reads as a soft cross rather than a hard cut.
+    if (p.ghost_alpha > 0.001) {
+        let ghost = textureSampleLevel(ghost_tex, smp, input.uv, 0.0);
+        color = mix(color, ghost, p.ghost_alpha);
     }
     return vec4<f32>(color.rgb, 1.0);
 }
