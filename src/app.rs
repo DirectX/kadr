@@ -4,7 +4,8 @@ use crate::capture::camera::{self, CameraInfo, CameraSource, CaptureStatus};
 use crate::capture::{FrameSlot, FrameSource, PatternKind, TestPatternSource};
 use crate::compositor::{Compositor, SCENE_H, SCENE_W};
 use crate::output::recorder::{self, AudioSource, Recorder, RecorderState};
-use crate::output::VirtualCamStub;
+use crate::output::vcam::{self, VcamInfo, VcamStatus, VirtualCam};
+use crate::output::Pacer;
 use crate::scene;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -15,6 +16,10 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
+
+/// Declared framerate of all CPU sinks (recording, virtual camera). One pacer
+/// drives every sink so they share grabs and stay timestamp-consistent.
+const SINK_FPS: u32 = 30;
 
 /// Preview pipeline: draws the scene render target into the panel rect.
 /// The rect maps to NDC [-1, +1] of the callback viewport — see preview.wgsl.
@@ -89,7 +94,13 @@ pub struct Studio {
     recorder: Recorder,
     audio_sources: Vec<AudioSource>,
     audio_choice: usize,
-    vcam: VirtualCamStub,
+    vcam: VirtualCam,
+    vcam_devices: Vec<VcamInfo>,
+    vcam_choice: usize,
+    /// Shared 30 fps cadence for all CPU sinks (one grab fans out).
+    sink_pacer: Pacer,
+    /// Sequence stamped onto published sink frames.
+    sink_seq: u64,
     stats: Stats,
 
     /// KADR_RESIZE_TEST=1: cycle window size and log preview geometry
@@ -139,7 +150,11 @@ impl Studio {
             recorder: Recorder::new(),
             audio_sources: recorder::list_audio_sources(),
             audio_choice: 0,
-            vcam: VirtualCamStub::new(),
+            vcam: VirtualCam::new(),
+            vcam_devices: vcam::enumerate_output(),
+            vcam_choice: 0,
+            sink_pacer: Pacer::new(SINK_FPS),
+            sink_seq: 0,
             stats: Stats::default(),
             debug: std::env::var("KADR_RESIZE_TEST").is_ok(),
             dbg_tick: 0,
@@ -349,12 +364,84 @@ impl Studio {
                     }
                     RecorderState::Idle => {}
                 }
-                let mut vc = self.vcam.active;
-                if ui.checkbox(&mut vc, "вирт-камера (stub)").changed() {
-                    if vc {
-                        self.vcam.start();
-                    } else {
-                        self.vcam.stop();
+                ui.separator();
+                ui.label("вирт-камера");
+                if self.vcam_devices.is_empty() {
+                    ui.label(
+                        egui::RichText::new("нет v4l2loopback-устройств")
+                            .small()
+                            .weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "sudo modprobe v4l2loopback video_devices=/dev/video20 \
+                             card_label=\"Kadr Cam\" formats=yuyv",
+                        )
+                        .small()
+                        .monospace(),
+                    );
+                } else {
+                    let choices: Vec<(usize, String, String)> = self
+                        .vcam_devices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| {
+                            (
+                                i,
+                                format!("{} (/dev/video{})", d.card, d.index),
+                                format!("formats: {}", d.formats.join(", ")),
+                            )
+                        })
+                        .collect();
+                    egui::ScrollArea::vertical()
+                        .max_height(72.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (idx, label, tooltip) in choices {
+                                if ui
+                                    .selectable_label(self.vcam_choice == idx, label)
+                                    .on_hover_text(tooltip)
+                                    .clicked()
+                                {
+                                    self.vcam_choice = idx;
+                                }
+                            }
+                        });
+                    if ui.small_button("↻ найти заново").clicked() {
+                        self.vcam_devices = vcam::enumerate_output();
+                        if self.vcam_choice >= self.vcam_devices.len().max(1) {
+                            self.vcam_choice = 0;
+                        }
+                    }
+                    let active = self.vcam.is_active();
+                    let btn = if active { "■ остановить" } else { "● запустить" };
+                    if ui.button(btn).clicked() {
+                        if active {
+                            self.vcam.stop();
+                        } else if let Some(dev) = self.vcam_devices.get(self.vcam_choice) {
+                            let idx = dev.index;
+                            self.vcam.start(idx, (SCENE_W, SCENE_H), SINK_FPS);
+                        }
+                    }
+                    match self.vcam.status() {
+                        VcamStatus::Starting(d) => {
+                            ui.label(egui::RichText::new(format!("запуск {d}…")).small().weak());
+                        }
+                        VcamStatus::Running { desc, frames } => {
+                            ui.label(
+                                egui::RichText::new(format!("{desc} · {frames} кадров"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(140, 220, 140)),
+                            );
+                        }
+                        VcamStatus::Error(e) => {
+                            ui.label(
+                                egui::RichText::new(format!("ошибка: {e}"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 110, 110)),
+                            );
+                        }
+                        VcamStatus::Stopped => {}
                     }
                 }
             });
@@ -417,7 +504,7 @@ impl Studio {
         self.scene.advance();
         gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
 
-        // Sink taps: CPU readback for the recorder, paced to the declared fps.
+        // Sink taps: one paced grab fans out to every active CPU consumer.
         if let Some(secs) = self.auto_record {
             if !self.recorder.is_active() && self.dbg_tick >= 1 && self.recorder.state().idle_like() && !self.auto_record_done {
                 self.auto_record_done = true;
@@ -425,7 +512,7 @@ impl Studio {
                     recorder::default_output_path(),
                     AudioSource::Default,
                     (SCENE_W, SCENE_H),
-                    30,
+                    SINK_FPS,
                 );
                 tracing::info!(path = %self.recorder.state().path_label().unwrap_or_default(), "auto-record started");
             }
@@ -438,16 +525,27 @@ impl Studio {
                 }
             }
         }
-        if self.recorder.want_frame() {
-            let grabbed = match self.recorder.sender() {
-                Some((tx, dropped)) => gfx.compositor.grab(move |bytes| {
-                    tracing::debug!(len = bytes.len(), "readback delivered");
-                    Recorder::feed(&tx, &dropped, bytes);
-                }),
-                None => false,
-            };
-            if self.dbg_tick % 60 == 0 {
-                tracing::debug!(grabbed, "recorder grab tick");
+        let vcam_active = self.vcam.is_active();
+        if self.sink_pacer.due() && (self.recorder.is_active() || vcam_active) {
+            self.sink_seq += 1;
+            let seq = self.sink_seq;
+            let rec = self.recorder.sender();
+            let vslot = vcam_active.then(|| self.vcam.slot().clone());
+            let grabbed = gfx.compositor.grab(move |bytes| {
+                tracing::debug!(len = bytes.len(), "readback delivered");
+                match (rec, vslot) {
+                    (Some((tx, dropped)), Some(slot)) => {
+                        // Both sinks active: one copy for the second consumer.
+                        VirtualCam::publish(&slot, seq, bytes.clone(), SCENE_W, SCENE_H);
+                        Recorder::feed(&tx, &dropped, bytes);
+                    }
+                    (Some((tx, dropped)), None) => Recorder::feed(&tx, &dropped, bytes),
+                    (None, Some(slot)) => VirtualCam::publish(&slot, seq, bytes, SCENE_W, SCENE_H),
+                    (None, None) => {}
+                }
+            });
+            if !grabbed {
+                tracing::debug!("all readback slots busy; sink frame skipped");
             }
         }
         // Wake readback completions so frames reach ffmpeg promptly.

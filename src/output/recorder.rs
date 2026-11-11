@@ -7,9 +7,8 @@
 //! into a bounded channel; when ffmpeg falls behind, fresh frames are dropped
 //! and counted (a stutter in the file beats a stutter in the live preview).
 //!
-//! Pacing: the window redraws at vsync (~60 Hz) but the file declares a fixed
-//! framerate. `want_frame()` gates grabs to the declared cadence, otherwise
-//! the recording would play back at double speed.
+//! Pacing lives outside (output::pacer): one grab fans out to several sinks at
+//! the same declared cadence, so the file never plays back at double speed.
 
 use std::io::Read;
 use std::io::Write;
@@ -169,15 +168,13 @@ impl RecorderState {
     }
 }
 
-/// Frame-pacing gate + pipe to the ffmpeg worker.
+/// Pipe to the ffmpeg worker. Frame pacing is external (output::pacer), so
+/// one grab can fan out to several sinks at the same cadence.
 pub struct Recorder {
     tx: Option<Arc<SyncSender<Vec<u8>>>>,
     worker: Option<JoinHandle<()>>,
     state: Arc<Mutex<RecorderState>>,
     dropped: Arc<AtomicU64>,
-    /// Pacing: declared fps and the next frame's due time.
-    frame_period: Duration,
-    next_due: Option<Instant>,
     started: Option<Instant>,
 }
 
@@ -188,8 +185,6 @@ impl Recorder {
             worker: None,
             state: Arc::new(Mutex::new(RecorderState::Idle)),
             dropped: Arc::new(AtomicU64::new(0)),
-            frame_period: Duration::from_secs_f64(1.0 / 30.0),
-            next_due: None,
             started: None,
         }
     }
@@ -204,30 +199,6 @@ impl Recorder {
 
     pub fn elapsed(&self) -> Option<Duration> {
         self.started.map(|t| t.elapsed())
-    }
-
-    /// Should the render loop grab a frame right now? Rate-gated to fps.
-    /// Tolerance = half a frame period, so vsync jitter doesn't lose frames.
-    pub fn want_frame(&mut self) -> bool {
-        if self.tx.is_none() {
-            return false;
-        }
-        let now = Instant::now();
-        match self.next_due {
-            None => {
-                self.next_due = Some(now + self.frame_period);
-                true
-            }
-            Some(due) if now + self.frame_period / 2 >= due => {
-                self.next_due = Some(if now > due {
-                    due + self.frame_period
-                } else {
-                    due
-                } + self.frame_period);
-                true
-            }
-            Some(_) => false,
-        }
     }
 
     /// Handle pair for the GPU readback closure (must be 'static + Send).
@@ -254,8 +225,6 @@ impl Recorder {
         if self.tx.is_some() {
             return;
         }
-        self.frame_period = Duration::from_secs_f64(1.0 / fps as f64);
-        self.next_due = None;
         self.dropped.store(0, Ordering::Relaxed);
         *self.state.lock().unwrap() = RecorderState::Starting { path: path.clone() };
 
@@ -407,7 +376,6 @@ impl Recorder {
             });
         }
         self.started = None;
-        self.next_due = None;
     }
 }
 
@@ -418,7 +386,7 @@ mod tests {
     #[test]
     fn civil_from_days_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(20_106), (2025, 1, 1));
+        assert_eq!(civil_from_days(20_089), (2025, 1, 1));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 
@@ -429,14 +397,14 @@ mod tests {
         assert!(name.starts_with("kadr-"), "{name}");
         assert!(name.ends_with(".mp4"), "{name}");
         // kadr-YYYYMMDD-HHMMSS.mp4
-        let digits: String = name[5..18].chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = name[5..20].chars().filter(|c| c.is_ascii_digit()).collect();
         assert_eq!(digits.len(), 14, "{name}");
     }
 
     #[test]
-    fn want_frame_rate_gates_when_active() {
-        let mut r = Recorder::new();
-        // No pipe yet -> never wants frames.
-        assert!(!r.want_frame());
+    fn idle_recorder_has_no_sender() {
+        let r = Recorder::new();
+        assert!(r.sender().is_none());
+        assert!(!r.is_active());
     }
 }
