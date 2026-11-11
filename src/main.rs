@@ -11,6 +11,7 @@
 mod app;
 mod capture;
 mod compositor;
+mod director;
 mod output;
 mod scene;
 mod track;

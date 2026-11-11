@@ -95,6 +95,14 @@ pub struct Studio {
     /// Face tracking (YuNet) toggle; the tracker thread idles when off.
     tracking: bool,
     tracker: FaceTracker,
+    /// Auto-director (policy layer). `directing` = enabled; the clock runs
+    /// from the moment it was switched on.
+    directing: bool,
+    director: Box<dyn crate::director::Director>,
+    director_started: std::time::Instant,
+    /// Previous tracker offset, for the rhythmic-motion signal.
+    last_face_offset: [f32; 2],
+    motion_smooth: f32,
     recorder: Recorder,
     audio_sources: Vec<AudioSource>,
     audio_choice: usize,
@@ -153,6 +161,13 @@ impl Studio {
             active_preset: 0,
             tracking: false,
             tracker: FaceTracker::new(),
+            directing: false,
+            director: Box::new(crate::director::ClockDirector::new(
+                crate::director::default_shots(),
+            )),
+            director_started: std::time::Instant::now(),
+            last_face_offset: [0.0; 2],
+            motion_smooth: 0.0,
             recorder: Recorder::new(),
             audio_sources: recorder::list_audio_sources(),
             audio_choice: 0,
@@ -223,6 +238,49 @@ impl Studio {
     }
 
     /// Toggle face tracking; attaching resets smoothing, detaching zeroes it.
+    /// One director beat: derive signals from state we already have, ask the
+    /// policy for a command, apply it through the SAME paths as manual input.
+    fn director_tick(&mut self) {
+        if !self.directing {
+            return;
+        }
+        use crate::director::DirectorInput;
+        let ts = self.tracker.state();
+        // Rhythmic signal: normalized face displacement since last frame.
+        // Smoothed so a single jitter does not fire a cut.
+        let dx = ts.offset[0] - self.last_face_offset[0];
+        let dy = ts.offset[1] - self.last_face_offset[1];
+        self.last_face_offset = ts.offset;
+        let inst = (dx * dx + dy * dy).sqrt() * 60.0; // per-second, UV units
+        self.motion_smooth = self.motion_smooth * 0.9 + inst.min(2.0) * 0.1;
+        let ev = DirectorInput {
+            now: self.director_started.elapsed(),
+            motion: self.motion_smooth,
+            face_size: ts.face_size,
+            confidence: ts.confidence,
+            cameras: self.cam_devices.len(),
+        };
+        match self.director.on_input(&ev) {
+            Some(crate::director::DirectorCmd::GotoLayout(idx)) => {
+                if let Some(layout) = scene::PRESETS.get(idx) {
+                    let name = layout.name;
+                    self.active_preset = idx;
+                    self.scene.transition_to(layout, 0.6);
+                    tracing::info!(layout = name, "director: cut");
+                }
+            }
+            Some(crate::director::DirectorCmd::SwitchCamera(n)) => self.set_camera(n),
+            Some(crate::director::DirectorCmd::SetTracking(on)) => self.set_tracking(on),
+            None => {}
+        }
+    }
+
+    /// Manual input takes over: pause the director's montage so it does not
+    /// instantly override a human decision.
+    fn director_reset(&mut self) {
+        self.director.reset(self.director_started.elapsed());
+    }
+
     fn set_tracking(&mut self, on: bool) {
         self.tracking = on;
         if on {
@@ -238,6 +296,7 @@ impl Studio {
     fn hotkey_camera(&mut self, number: usize) {
         if number <= self.cam_devices.len() {
             self.set_camera(number);
+            self.director_reset();
             let name = self.cam_devices.get(number.saturating_sub(1)).map(|d| d.card.as_str()).unwrap_or("?");
             tracing::info!(slot = number, name, "hotkey: camera switch");
         }
@@ -329,7 +388,40 @@ impl Studio {
                     {
                         self.active_preset = idx;
                         self.scene.transition_to(layout, 0.6);
+                        self.director_reset(); // manual decision wins
                     }
+                }
+                ui.separator();
+                let mut dr = self.directing;
+                if ui.checkbox(&mut dr, "авторежиссёр (метроном)").changed() {
+                    self.directing = dr;
+                    if dr {
+                        self.director_started = std::time::Instant::now();
+                        self.director_reset();
+                        tracing::info!("director enabled");
+                    } else {
+                        tracing::info!("director disabled");
+                    }
+                }
+                if self.directing {
+                    if let Some(b) = self.director.beat() {
+                        let name = scene::PRESETS
+                            .get(b.layout)
+                            .map(|l| l.name)
+                            .unwrap_or("?");
+                        let frac = (b.held.as_secs_f32() / b.target.as_secs_f32()).min(1.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .text(format!("бит: {name} · {:.0}/{:.0} с", b.held.as_secs_f32(), b.target.as_secs_f32())),
+                        );
+                    }
+                    ui.add_enabled_ui(self.motion_smooth > 0.0, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("движение: {:.2}", self.motion_smooth))
+                                .small()
+                                .weak(),
+                        );
+                    });
                 }
                 ui.separator();
                 let mut tr = self.tracking;
@@ -573,6 +665,7 @@ impl Studio {
         if self.tracking {
             self.scene.track_offset = self.tracker.state().offset;
         }
+        self.director_tick();
         gfx.compositor.render_scene(&gfx.device, &gfx.queue, &self.scene);
 
         // Sink taps: one paced grab fans out to every active CPU consumer.
