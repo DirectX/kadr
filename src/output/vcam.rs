@@ -241,9 +241,18 @@ fn writer_loop(
                     };
                 }
             }
-            // Timeout means readers hold every buffer; skipping a tick is
-            // correct — the next frame will land when one frees up.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut) => {}
+            // Same timeout-recovery as capture: an EWOULDBLOCK from the
+            // nonblocking DQBUF leaves our last-filled buffer parked in the
+            // driver queue; re-queueing it on the next call would EINVAL.
+            // STREAMOFF returns all buffers, so the next() restart is clean.
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+            {
+                tracing::debug!(%desc, "readers hold all buffers; recycling stream");
+                stream.stop().ok();
+            }
             Err(e) => {
                 stream.stop().ok();
                 return Err(format!("output: {e}"));

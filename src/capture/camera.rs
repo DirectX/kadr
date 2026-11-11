@@ -162,16 +162,19 @@ fn attempt(
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), String> {
     // Reopen per attempt: fresh fd, clean buffer/queue state.
-    let dev = Device::new(index as usize).map_err(|e| e.to_string())?;
+    let dev = Device::new(index as usize).map_err(|e| format!("OPEN: {e}"))?;
     let fmt = dev
         .set_format(&v4l::format::Format::new(width, height, fcc))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("S_FMT {} {width}x{height}: {e}", fcc.str().unwrap_or("????")))?;
     // Note: no S_PARM here. Some UVC drivers dislike zeroed streamparam
     // structs; frame-interval control is a later enhancement.
 
-    let mut stream =
-        MmapStream::with_buffers(&dev, Type::VideoCapture, 4).map_err(|e| e.to_string())?;
-    stream.set_timeout(Duration::from_millis(200));
+    let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4)
+        .map_err(|e| format!("REQBUFS/MMAP: {e}"))?;
+    // 500 ms: comfortably above cold-UVC-sensor first-frame latency (AE/AWB
+    // convergence, USB alt-setting retrain), which a 200 ms poll kept cutting
+    // off and misreading as a dead mode. Timeouts are recovered, not fatal.
+    stream.set_timeout(Duration::from_millis(500));
 
     let desc = format!(
         "/dev/video{index} {} {}x{}",
@@ -244,16 +247,27 @@ fn attempt(
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
             ) =>
             {
+                // CRITICAL: a timeout inside next() leaves the crate's bookkeeping
+                // unable to resume — the next call re-queues the buffer that is
+                // still in the driver's incoming queue, and the kernel answers
+                // EINVAL (this bug masqueraded as "every mode fails" for weeks).
+                // STREAMOFF returns all queued buffers to the client, so the
+                // following next() re-enqueues them all and restarts cleanly.
+                tracing::debug!(%desc, frames, "no frame within poll timeout; recycling stream");
+                stream.stop().ok();
                 let silent = last_frame.elapsed();
                 let budget = if frames == 0 { FIRST_FRAME_BUDGET } else { STALL_BUDGET };
                 if silent > budget {
-                    stream.stop().ok();
                     return Err(format!("no frames for {:.2}s", silent.as_secs_f32()));
                 }
             }
             Err(e) => {
                 stream.stop().ok();
-                return Err(e.to_string());
+                // Stage label matters for diagnosis: EINVAL on the very first
+                // poll after STREAMON means the stream never started; EINVAL
+                // mid-run means the device died while producing.
+                let stage = if frames == 0 { "first DQBUF (post-STREAMON)" } else { "DQBUF" };
+                return Err(format!("{stage}: {e}"));
             }
         }
     }
