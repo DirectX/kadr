@@ -1,21 +1,34 @@
 //! V4L2 capture source: real webcams and v4l2loopback devices.
 //!
-//! Only formats that are cheap to convert on the CPU are used (RGB/BGR packed,
+//! Only formats that are cheap to convert on the CPU are used (packed RGB/BGR,
 //! YUV 4:2:2). MJPEG would need a decoder (zune-jpeg or an ffmpeg-pipe) —
 //! tracked as a TODO; loopback cams and most webcams speak YUYV natively.
+//!
+//! Cameras routinely *offer* modes they cannot sustain (uncompressed 720p over
+//! USB2 dies with EINVAL about a second after STREAMON). So the capture thread
+//! walks a candidate ladder (fourcc x size), and the first mode that actually
+//! delivers frames wins; a watchdog drops a mode that goes silent.
 
 use super::{Frame, FrameSource, FrameSlot};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use v4l::buffer::Type;
 use v4l::capability::Flags;
 use v4l::format::FourCC;
+use v4l::fraction::Fraction;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::{CaptureStream, Stream};
+use v4l::video::capture::Parameters;
 use v4l::video::traits::Capture;
 use v4l::Device;
+
+const SIZES: [(u32, u32); 3] = [(1280, 720), (640, 480), (320, 240)];
+/// No frame at all within this budget -> mode is dead, fall back.
+const FIRST_FRAME_BUDGET: Duration = Duration::from_millis(3000);
+/// Mid-stream silence longer than this -> mode stalled, fall back.
+const STALL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Info about one `/dev/video<N>` capture device.
 #[derive(Clone, Debug)]
@@ -28,39 +41,34 @@ pub struct CameraInfo {
     pub formats: Vec<String>,
 }
 
-/// Pixel format we know how to convert and its negotiated size.
-#[derive(Clone, Copy, Debug)]
-struct Negotiated {
-    fourcc: FourCC,
-    width: u32,
-    height: u32,
-}
-
 /// Shared camera thread state, read by the UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CaptureStatus {
-    Starting,
+    /// Argument: the mode currently being probed (empty = starting up).
+    Starting(String),
     Running { desc: String },
     Error(String),
     Stopped,
 }
 
 /// Enumerate V4L2 capture devices. Errors are non-fatal: an unreadable node is
-/// simply skipped (the sandbox or a missing permission should not break the UI).
+/// simply skipped (a sandbox or a missing permission must not break the UI).
 pub fn enumerate() -> Vec<CameraInfo> {
     let mut found = Vec::new();
     if let Ok(dir) = std::fs::read_dir("/dev") {
+        let mut indices = Vec::new();
         for entry in dir.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(rest) = name.strip_prefix("video") {
                 if let Ok(index) = rest.parse::<u32>() {
-                    found.push(index);
+                    indices.push(index);
                 }
             }
         }
+        indices.sort_unstable();
+        found = indices;
     }
-    found.sort_unstable();
 
     let mut out = Vec::new();
     for index in found {
@@ -97,64 +105,103 @@ fn preferred_fourccs() -> [FourCC; 5] {
     ]
 }
 
-fn negotiate(dev: &Device) -> Result<Negotiated, String> {
+/// (fourcc, width, height) candidates ordered by preference, filtered through
+/// the device's own ENUM_FRAMESIZES where available.
+fn candidates(dev: &Device) -> Result<Vec<(FourCC, u32, u32)>, String> {
     let supported = dev.enum_formats().map_err(|e| e.to_string())?;
-    let sizes = [(1280u32, 720u32), (640, 480), (320, 240)];
-    for want in preferred_fourccs() {
-        if !supported.iter().any(|d| d.fourcc == want) {
+    let have = |fcc: FourCC| supported.iter().any(|d| d.fourcc == fcc);
+
+    let mut out = Vec::new();
+    for fcc in preferred_fourccs() {
+        if !have(fcc) {
             continue;
         }
-        for (w, h) in sizes {
-            if let Ok(fmt) = dev.set_format(&v4l::format::Format::new(w, h, want)) {
-                return Ok(Negotiated {
-                    fourcc: want,
-                    width: fmt.width,
-                    height: fmt.height,
-                });
+        let allowed: Option<Vec<(u32, u32)>> = dev.enum_framesizes(fcc).ok().map(|list| {
+            list.into_iter()
+                .flat_map(|fs| fs.size.to_discrete())
+                .map(|d| (d.width, d.height))
+                .collect()
+        });
+        for (w, h) in SIZES {
+            match &allowed {
+                Some(list) if !list.contains(&(w, h)) => continue,
+                _ => out.push((fcc, w, h)),
             }
         }
     }
-    let list: Vec<String> = supported
-        .iter()
-        .filter_map(|d| d.fourcc.str().ok().map(String::from))
-        .collect();
-    Err(format!(
-        "no supported pixel format; device offers: {} \
-         (MJPEG decoding not implemented yet)",
-        list.join(", ")
-    ))
+    if out.is_empty() {
+        let list: Vec<String> = supported
+            .iter()
+            .filter_map(|d| d.fourcc.str().ok().map(String::from))
+            .collect();
+        return Err(format!(
+            "no supported pixel format; device offers: {} \
+             (MJPEG decoding not implemented yet)",
+            list.join(", ")
+        ));
+    }
+    Ok(out)
 }
 
-fn capture_loop(
+/// One mode attempt: open, set format, stream until stopped, watchdog on stalls.
+/// Ok(()) = ran until stop was requested; Err = caller should try the next mode.
+fn attempt(
     index: u32,
+    fcc: FourCC,
+    width: u32,
+    height: u32,
     stop: &AtomicBool,
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), String> {
-    let dev = Device::new(index as usize).map_err(|e| format!("open /dev/video{index}: {e}"))?;
-    let fmt = negotiate(&dev)?;
-    let mut stream = MmapStream::new(&dev, Type::VideoCapture).map_err(|e| e.to_string())?;
+    // Reopen per attempt: fresh fd, clean buffer/queue state.
+    let dev = Device::new(index as usize).map_err(|e| e.to_string())?;
+    let fmt = dev
+        .set_format(&v4l::format::Format::new(width, height, fcc))
+        .map_err(|e| e.to_string())?;
+    // Ask for 30 fps; best-effort, many UVC cameras ignore S_PARM.
+    let mut params = Parameters::new(Fraction::new(1, 30));
+    if let Ok(p) = dev.params() {
+        params = p;
+        params.interval = Fraction::new(1, 30);
+    }
+    let _ = dev.set_params(&params);
+
+    let mut stream =
+        MmapStream::with_buffers(&dev, Type::VideoCapture, 4).map_err(|e| e.to_string())?;
     stream.set_timeout(Duration::from_millis(200));
 
     let desc = format!(
         "/dev/video{index} {} {}x{}",
-        fmt.fourcc.str().unwrap_or("????"),
+        fcc.str().unwrap_or("????"),
         fmt.width,
         fmt.height
     );
-    tracing::info!(%desc, "camera running");
-    *status.lock().unwrap() = CaptureStatus::Running { desc };
-
     let npix = (fmt.width * fmt.height) as usize;
     let mut seq = 0u64;
+    let mut frames = 0u64;
     let mut rgba = Vec::new();
-    while !stop.load(Ordering::Relaxed) {
+    let mut last_frame = Instant::now();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            stream.stop().ok();
+            return Ok(());
+        }
         match stream.next() {
             Ok((data, meta)) => {
+                frames += 1;
+                if frames == 1 {
+                    tracing::info!(%desc, "camera running");
+                    *status.lock().unwrap() = CaptureStatus::Running { desc: desc.clone() };
+                }
                 let n = (meta.bytesused as usize).min(data.len());
                 rgba.clear();
                 rgba.resize(npix * 4, 0u8);
-                convert(&fmt, &data[..n], &mut rgba)?;
+                if let Err(e) = convert(fcc, fmt.width, fmt.height, &data[..n], &mut rgba) {
+                    stream.stop().ok();
+                    return Err(e);
+                }
                 seq += 1;
                 slot.publish(Frame {
                     width: fmt.width,
@@ -162,18 +209,60 @@ fn capture_loop(
                     seq,
                     data: std::mem::take(&mut rgba),
                 });
+                last_frame = Instant::now();
             }
-            // Timeout just means "no frame yet" — poll the stop flag and retry.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(e) => return Err(format!("capture: {e}")),
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+            {
+                let silent = last_frame.elapsed();
+                let budget = if frames == 0 { FIRST_FRAME_BUDGET } else { STALL_BUDGET };
+                if silent > budget {
+                    stream.stop().ok();
+                    return Err(format!("no frames for {:.2}s", silent.as_secs_f32()));
+                }
+            }
+            Err(e) => {
+                stream.stop().ok();
+                return Err(e.to_string());
+            }
         }
     }
-    stream.stop().ok();
-    Ok(())
+}
+
+/// Candidate ladder; first mode that streams wins. Runs until `stop`.
+fn run(
+    index: u32,
+    stop: &AtomicBool,
+    slot: &FrameSlot,
+    status: &Mutex<CaptureStatus>,
+) -> Result<(), String> {
+    let cands = {
+        let dev = Device::new(index as usize).map_err(|e| format!("open /dev/video{index}: {e}"))?;
+        candidates(&dev)?
+    };
+    let total = cands.len();
+    let mut last_err = String::from("no attempt ran");
+    for (n, (fcc, w, h)) in cands.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let what = format!(
+            "video{index}: {} {w}x{h} ({}/{total})",
+            fcc.str().unwrap_or("????"),
+            n + 1
+        );
+        *status.lock().unwrap() = CaptureStatus::Starting(what.clone());
+        match attempt(index, *fcc, *w, *h, stop, slot, status) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(mode = %what, error = %e, "camera mode failed, falling back");
+                last_err = format!("{what}: {e}");
+            }
+        }
+    }
+    Err(format!("every mode failed; last: {last_err}"))
 }
 
 pub struct CameraSource {
@@ -190,11 +279,13 @@ impl CameraSource {
         let slot = Arc::new(FrameSlot::new());
         let (stop_c, slot_c) = (stop.clone(), slot.clone());
         thread::spawn(move || {
-            if let Err(e) = capture_loop(index, &stop_c, &slot_c, &status) {
-                tracing::error!(index, error = %e, "camera stopped");
-                *status.lock().unwrap() = CaptureStatus::Error(e);
-            } else {
-                *status.lock().unwrap() = CaptureStatus::Stopped;
+            let result = run(index, &stop_c, &slot_c, &status);
+            match result {
+                Ok(()) => *status.lock().unwrap() = CaptureStatus::Stopped,
+                Err(e) => {
+                    tracing::error!(index, error = %e, "camera failed");
+                    *status.lock().unwrap() = CaptureStatus::Error(e);
+                }
             }
         });
         Self {
@@ -222,24 +313,24 @@ impl Drop for CameraSource {
 
 // ---------------------------------------------------------------------------
 // Color conversion to RGBA8. BT.601 integer approximation, fast enough for
-// 1280x720@30 on a NUC-class CPU; a shader path is on the TODO list.
+// 1280x720@30 on a NUC-class CPU; a compute-shader path is on the TODO list.
 // ---------------------------------------------------------------------------
 
-fn convert(fmt: &Negotiated, src: &[u8], dst: &mut [u8]) -> Result<(), String> {
-    if dst.len() < (fmt.width * fmt.height * 4) as usize {
+fn convert(fcc: FourCC, width: u32, height: u32, src: &[u8], dst: &mut [u8]) -> Result<(), String> {
+    let npix = (width * height) as usize;
+    if dst.len() < npix * 4 {
         return Err("frame too small".into());
     }
-    let f = fmt.fourcc;
-    if f == FourCC::new(b"YUYV") || f == FourCC::new(b"YUY2") {
-        yuv422_to_rgba(src, dst, (fmt.width * fmt.height) as usize, false);
-    } else if f == FourCC::new(b"UYVY") {
-        yuv422_to_rgba(src, dst, (fmt.width * fmt.height) as usize, true);
-    } else if f == FourCC::new(b"RGB3") {
-        rgbx_to_rgba(src, dst, (fmt.width * fmt.height) as usize, 0, 1, 2);
-    } else if f == FourCC::new(b"BGR3") {
-        rgbx_to_rgba(src, dst, (fmt.width * fmt.height) as usize, 2, 1, 0);
+    if fcc == FourCC::new(b"YUYV") || fcc == FourCC::new(b"YUY2") {
+        yuv422_to_rgba(src, dst, npix, false);
+    } else if fcc == FourCC::new(b"UYVY") {
+        yuv422_to_rgba(src, dst, npix, true);
+    } else if fcc == FourCC::new(b"RGB3") {
+        rgbx_to_rgba(src, dst, npix, 0, 1, 2);
+    } else if fcc == FourCC::new(b"BGR3") {
+        rgbx_to_rgba(src, dst, npix, 2, 1, 0);
     } else {
-        return Err(format!("unsupported fourcc {:?}", f.str().ok()));
+        return Err(format!("unsupported fourcc {:?}", fcc.str().ok()));
     }
     Ok(())
 }

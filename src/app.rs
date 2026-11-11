@@ -155,7 +155,7 @@ impl Studio {
         } else {
             let idx = self.cam_devices.get(choice - 1).map(|d| d.index);
             if let Some(index) = idx {
-                let status = Arc::new(Mutex::new(CaptureStatus::Starting));
+                let status = Arc::new(Mutex::new(CaptureStatus::Starting(String::new())));
                 self.cam_src = Box::new(CameraSource::start(index, status.clone()));
                 self.cam_status = status;
             }
@@ -235,7 +235,10 @@ impl Studio {
                 }
                 let status = self.cam_status.lock().unwrap().clone();
                 let (txt, color) = match &status {
-                    CaptureStatus::Starting => ("запуск…".into(), egui::Color32::GOLD),
+                    CaptureStatus::Starting(msg) => (
+                        if msg.is_empty() { "запуск…".to_string() } else { format!("пробую {msg}…") },
+                        egui::Color32::GOLD,
+                    ),
                     CaptureStatus::Running { desc } => (desc.clone(), egui::Color32::from_rgb(140, 220, 140)),
                     CaptureStatus::Error(e) => (e.clone(), egui::Color32::from_rgb(230, 110, 110)),
                     CaptureStatus::Stopped => ("остановлена".into(), egui::Color32::GRAY),
