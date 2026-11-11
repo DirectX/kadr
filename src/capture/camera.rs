@@ -259,44 +259,17 @@ fn attempt(
     }
 }
 
-/// Candidate ladder; first mode that streams wins. Runs until `stop`.
-fn run(
+/// Candidate ladder on one node; first mode that streams wins.
+/// Ok(()) = running until stop; Err = last failure description.
+fn ladder(
     index: u32,
+    cands: &[(FourCC, u32, u32)],
     stop: &AtomicBool,
     slot: &FrameSlot,
     status: &Mutex<CaptureStatus>,
 ) -> Result<(), String> {
-    // Opening can hit EBUSY right after a source switch: the previous thread
-    // still holds the fd until its poll times out (~200 ms). Retry briefly.
-    let cands = {
-        let mut opened: Option<Vec<(FourCC, u32, u32)>> = None;
-        let mut busy_err = String::new();
-        for i in 0..8 {
-            match Device::new(index as usize) {
-                Ok(dev) => {
-                    opened = Some(candidates(&dev)?);
-                    break;
-                }
-                Err(e) if e.raw_os_error() == Some(16 /* EBUSY */) && i < 7 => {
-                    tracing::debug!(index, attempt = i + 1, "device busy, retrying");
-                    busy_err = e.to_string();
-                    std::thread::sleep(Duration::from_millis(150));
-                }
-                Err(e) => return Err(format!("open /dev/video{index}: {e}")),
-            }
-        }
-        match opened {
-            Some(c) => c,
-            None => {
-                return Err(format!(
-                    "open /dev/video{index}: {busy_err} (held by the previous session)"
-                ))
-            }
-        }
-    };
     let total = cands.len();
     let mut last_err = String::from("no attempt ran");
-    let mut modes_failed = 0usize;
     for (n, (fcc, w, h)) in cands.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -312,24 +285,105 @@ fn run(
             Err(e) => {
                 tracing::warn!(mode = %what, error = %e, "camera mode failed, falling back");
                 last_err = format!("{what}: {e}");
-                modes_failed += 1;
             }
         }
     }
-    // Multi-node cameras expose several /dev/video* and not all of them can
-    // actually stream. If everything failed here, point at the alternatives.
-    let mut hint = String::new();
-    if modes_failed > 0 {
-        let others: Vec<String> = enumerate()
-            .into_iter()
-            .filter(|d| d.index != index)
-            .map(|d| format!("/dev/video{} [{}]", d.index, d.formats.join("/")))
-            .collect();
-        if !others.is_empty() {
-            hint = format!("; other capture nodes: {}", others.join(", "));
+    Err(last_err)
+}
+
+/// Open the node (with EBUSY retry) and build its candidate list.
+fn candidates_for(index: u32) -> Result<Vec<(FourCC, u32, u32)>, String> {
+    // Opening can hit EBUSY right after a source switch: the previous thread
+    // still holds the fd until its poll times out (~200 ms). Retry briefly.
+    let mut opened: Option<Vec<(FourCC, u32, u32)>> = None;
+    let mut busy_err = String::new();
+    for i in 0..8 {
+        match Device::new(index as usize) {
+            Ok(dev) => {
+                opened = Some(candidates(&dev)?);
+                break;
+            }
+            Err(e) if e.raw_os_error() == Some(16 /* EBUSY */) && i < 7 => {
+                tracing::debug!(index, attempt = i + 1, "device busy, retrying");
+                busy_err = e.to_string();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => return Err(format!("open /dev/video{index}: {e}")),
         }
     }
-    Err(format!("every mode failed; last: {last_err}{hint}"))
+    opened.ok_or_else(|| format!("open /dev/video{index}: {busy_err} (held by the previous session)"))
+}
+
+/// Capture strategy for one chosen device, with recovery passes:
+///
+/// 1. ladder on the selected node;
+/// 2. cooldown + ladder again — a cold UVC node can reject STREAMON for a
+///    second or two after enumeration;
+/// 3. ladder on sibling capture nodes — multi-interface cameras (Logitech
+///    BRIO) move the live streaming node after a USB re-enumeration
+///    (observed: selected video1 went EINVAL-on-every-mode while a fresh
+///    video5 [YUYV/MJPG] appeared); the dead node can never stream again.
+fn run(
+    index: u32,
+    stop: &AtomicBool,
+    slot: &FrameSlot,
+    status: &Mutex<CaptureStatus>,
+) -> Result<(), String> {
+    let cands = candidates_for(index)?;
+
+    let err1 = match ladder(index, &cands, stop, slot, status) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    tracing::warn!(index, error = %err1, "selected node failed; cooling down and retrying");
+    *status.lock().unwrap() = CaptureStatus::Starting(format!("video{index}: cooldown + retry"));
+    std::thread::sleep(Duration::from_secs(2));
+    match candidates_for(index) {
+        Ok(c) => match ladder(index, &c, stop, slot, status) {
+            Ok(()) => {
+                tracing::info!(index, "camera came up on retry");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(index, error = %e, "retry failed");
+            }
+        },
+        Err(e) => tracing::warn!(index, error = %e, "reopen for retry failed"),
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    // Pass 3: probe sibling nodes.
+    let siblings: Vec<u32> = enumerate()
+        .into_iter()
+        .filter(|d| d.index != index)
+        .map(|d| d.index)
+        .collect();
+    for sib in siblings {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Ok(c) = candidates_for(sib) else { continue };
+        tracing::info!(selected = index, trying = sib, "probing sibling capture node");
+        *status.lock().unwrap() =
+            CaptureStatus::Starting(format!("video{sib} (заменяет video{index})"));
+        match ladder(sib, &c, stop, slot, status) {
+            Ok(()) => {
+                tracing::info!(sib, selected = index, "camera came up on a sibling node");
+                return Ok(());
+            }
+            Err(e) => tracing::warn!(sib, error = %e, "sibling node failed"),
+        }
+    }
+
+    Err(format!(
+        "every mode failed on video{index} and its siblings; last: {err1}"
+    ))
 }
 
 pub struct CameraSource {
