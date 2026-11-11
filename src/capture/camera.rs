@@ -1,11 +1,12 @@
 //! V4L2 capture source: real webcams and v4l2loopback devices.
 //!
-//! Only formats that are cheap to convert on the CPU are used (packed RGB/BGR,
-//! YUV 4:2:2). MJPEG would need a decoder (zune-jpeg or an ffmpeg-pipe) —
-//! tracked as a TODO; loopback cams and most webcams speak YUYV natively.
+//! Supported wire formats: MJPEG (decoded on CPU via zune-jpeg) and packed
+//! RGB/BGR + YUV 4:2:2 (integer conversion). MJPEG goes first in the ladder:
+//! it is the only mode most UVC webcams can sustain over USB2 at decent
+//! resolutions (a Logitech BRIO, for example, answers EINVAL on every
+//! uncompressed size). Corrupt MJPEG frames are skipped, not fatal.
 //!
-//! Cameras routinely *offer* modes they cannot sustain (uncompressed 720p over
-//! USB2 dies with EINVAL about a second after STREAMON). So the capture thread
+//! Cameras routinely *offer* modes they cannot sustain. So the capture thread
 //! walks a candidate ladder (fourcc x size), and the first mode that actually
 //! delivers frames wins; a watchdog drops a mode that goes silent.
 
@@ -17,14 +18,14 @@ use std::time::{Duration, Instant};
 use v4l::buffer::Type;
 use v4l::capability::Flags;
 use v4l::format::FourCC;
-use v4l::fraction::Fraction;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::{CaptureStream, Stream};
-use v4l::video::capture::Parameters;
 use v4l::video::traits::Capture;
 use v4l::Device;
+use zune_jpeg::zune_core::colorspace::ColorSpace;
+use zune_jpeg::zune_core::options::DecoderOptions;
 
-const SIZES: [(u32, u32); 3] = [(1280, 720), (640, 480), (320, 240)];
+const SIZES: [(u32, u32); 4] = [(1280, 720), (960, 540), (640, 480), (320, 240)];
 /// No frame at all within this budget -> mode is dead, fall back.
 const FIRST_FRAME_BUDGET: Duration = Duration::from_millis(3000);
 /// Mid-stream silence longer than this -> mode stalled, fall back.
@@ -95,8 +96,9 @@ pub fn enumerate() -> Vec<CameraInfo> {
     out
 }
 
-fn preferred_fourccs() -> [FourCC; 5] {
+fn preferred_fourccs() -> [FourCC; 6] {
     [
+        FourCC::new(b"MJPG"),
         FourCC::new(b"YUYV"),
         FourCC::new(b"YUY2"),
         FourCC::new(b"UYVY"),
@@ -135,8 +137,7 @@ fn candidates(dev: &Device) -> Result<Vec<(FourCC, u32, u32)>, String> {
             .filter_map(|d| d.fourcc.str().ok().map(String::from))
             .collect();
         return Err(format!(
-            "no supported pixel format; device offers: {} \
-             (MJPEG decoding not implemented yet)",
+            "no supported pixel format; device offers: {}",
             list.join(", ")
         ));
     }
@@ -159,13 +160,8 @@ fn attempt(
     let fmt = dev
         .set_format(&v4l::format::Format::new(width, height, fcc))
         .map_err(|e| e.to_string())?;
-    // Ask for 30 fps; best-effort, many UVC cameras ignore S_PARM.
-    let mut params = Parameters::new(Fraction::new(1, 30));
-    if let Ok(p) = dev.params() {
-        params = p;
-        params.interval = Fraction::new(1, 30);
-    }
-    let _ = dev.set_params(&params);
+    // Note: no S_PARM here. Some UVC drivers dislike zeroed streamparam
+    // structs; frame-interval control is a later enhancement.
 
     let mut stream =
         MmapStream::with_buffers(&dev, Type::VideoCapture, 4).map_err(|e| e.to_string())?;
@@ -178,9 +174,10 @@ fn attempt(
         fmt.height
     );
     let npix = (fmt.width * fmt.height) as usize;
+    let is_mjpeg = fcc == FourCC::new(b"MJPG");
     let mut seq = 0u64;
     let mut frames = 0u64;
-    let mut rgba = Vec::new();
+    let mut rgba = vec![0u8; npix * 4];
     let mut last_frame = Instant::now();
 
     loop {
@@ -198,7 +195,19 @@ fn attempt(
                 let n = (meta.bytesused as usize).min(data.len());
                 rgba.clear();
                 rgba.resize(npix * 4, 0u8);
-                if let Err(e) = convert(fcc, fmt.width, fmt.height, &data[..n], &mut rgba) {
+                if is_mjpeg {
+                    // MJPEG: zune-jpeg decodes straight into the RGBA buffer.
+                    let mut dec = zune_jpeg::JpegDecoder::new_with_options(
+                        &data[..n],
+                        DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGBA),
+                    );
+                    if let Err(e) = dec.decode_into(&mut rgba) {
+                        // Corrupt/truncated frame: skip it, keep the mode.
+                        tracing::debug!(error = ?e, "mjpeg frame skipped");
+                        last_frame = Instant::now();
+                        continue;
+                    }
+                } else if let Err(e) = convert(fcc, fmt.width, fmt.height, &data[..n], &mut rgba) {
                     stream.stop().ok();
                     return Err(e);
                 }
@@ -244,6 +253,7 @@ fn run(
     };
     let total = cands.len();
     let mut last_err = String::from("no attempt ran");
+    let mut modes_failed = 0usize;
     for (n, (fcc, w, h)) in cands.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -259,10 +269,24 @@ fn run(
             Err(e) => {
                 tracing::warn!(mode = %what, error = %e, "camera mode failed, falling back");
                 last_err = format!("{what}: {e}");
+                modes_failed += 1;
             }
         }
     }
-    Err(format!("every mode failed; last: {last_err}"))
+    // Multi-node cameras expose several /dev/video* and not all of them can
+    // actually stream. If everything failed here, point at the alternatives.
+    let mut hint = String::new();
+    if modes_failed > 0 {
+        let others: Vec<String> = enumerate()
+            .into_iter()
+            .filter(|d| d.index != index)
+            .map(|d| format!("/dev/video{} [{}]", d.index, d.formats.join("/")))
+            .collect();
+        if !others.is_empty() {
+            hint = format!("; other capture nodes: {}", others.join(", "));
+        }
+    }
+    Err(format!("every mode failed; last: {last_err}{hint}"))
 }
 
 pub struct CameraSource {
@@ -376,5 +400,41 @@ fn rgbx_to_rgba(src: &[u8], dst: &mut [u8], npix: usize, r: usize, g: usize, b: 
         dst[p * 4 + 1] = src[s + g];
         dst[p * 4 + 2] = src[s + b];
         dst[p * 4 + 3] = 255;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The MJPEG path must survive a real camera JPEG (baseline, 4:2:0,
+    /// huffman-coded) and produce non-black RGBA.
+    #[test]
+    fn mjpeg_decodes_to_rgba() {
+        let jpg = include_bytes!("../../tests/fixtures/mjpeg_sample.jpg");
+        let (w, h) = (160u32, 120u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let mut dec = zune_jpeg::JpegDecoder::new_with_options(
+            &jpg[..],
+            DecoderOptions::new_fast().jpeg_set_out_colorspace(ColorSpace::RGBA),
+        );
+        dec.decode_into(&mut rgba).expect("decode");
+        let nonzero = rgba.iter().filter(|b| **b != 0).count();
+        assert!(nonzero > rgba.len() / 4, "frame looks blank: {nonzero}");
+        // Alpha channel must be opaque for every pixel.
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn yuyv_gray_is_neutral() {
+        // Neutral gray at U=V=128 must map to roughly equal RGB.
+        let src = [128u8, 128, 128, 128];
+        let mut dst = vec![0u8; 8];
+        yuv422_to_rgba(&src, &mut dst, 2, false);
+        for px in dst.chunks_exact(4) {
+            assert!((px[0] as i32 - px[1] as i32).abs() < 8, "not neutral: {px:?}");
+            assert!(px[2] > 40, "blue channel collapsed: {px:?}");
+            assert_eq!(px[3], 255);
+        }
     }
 }

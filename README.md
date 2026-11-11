@@ -62,7 +62,8 @@ ffmpeg subprocess (в плане) · v4l2loopback (вирт-камера) · Pip
       превью через PaintCallback, панель управления
 - [x] Модель сцены: пресеты + твины переходов (`ease_out_back` — «пиу»-зум)
 - [x] Источники: контракт `FrameSlot` + тест-паттерны
-- [~] Камера: v4l2-захват (YUYV/UYVY/RGB3/BGR3, MJPEG — TODO) — ждёт теста на железе;
+- [~] Камера: v4l2-захват (MJPEG/zune-jpeg + YUYV/UYVY/RGB3/BGR3, каскад
+      режимов с watchdog) — ждёт подтверждения на железе (BRIO);
       `scripts/camera-loopback-test.sh` проверяет путь без вебкамеры
 - [ ] Захват экрана: portal ScreenCast + PipeWire
 - [ ] Запись: ffmpeg-subprocess (видео + микрофон)
